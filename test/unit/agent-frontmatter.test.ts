@@ -66,6 +66,47 @@ Do work
 	});
 });
 
+describe("chain discovery", () => {
+	it("prefers same-scope .chain.json over .chain.md for the same runtime name", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-chain-format-precedence-"));
+		tempDirs.push(dir);
+		const chainsDir = path.join(dir, ".pi", "chains");
+		fs.mkdirSync(chainsDir, { recursive: true });
+		fs.writeFileSync(path.join(chainsDir, "dynamic-review.chain.md"), `---
+name: dynamic-review
+description: Markdown fallback
+---
+
+## scout
+
+Run the markdown chain
+`, "utf-8");
+		fs.writeFileSync(path.join(chainsDir, "dynamic-review.chain.json"), JSON.stringify({
+			name: "dynamic-review",
+			description: "JSON dynamic chain",
+			chain: [
+				{
+					agent: "scout",
+					task: "Return targets",
+					as: "targets",
+					outputSchema: { type: "object" },
+				},
+				{
+					expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {item.path}" },
+					collect: { as: "reviews" },
+				},
+			],
+		}), "utf-8");
+
+		const result = discoverAgentsAll(dir);
+		const chain = result.chains.find((candidate) => candidate.name === "dynamic-review");
+		assert.equal(chain?.description, "JSON dynamic chain");
+		assert.equal(chain?.filePath.endsWith(".chain.json"), true);
+		assert.equal("expand" in (chain?.steps[1] ?? {}), true);
+	});
+});
+
 describe("agent frontmatter completionGuard", () => {
 	it("serializes disabled completion guard into agent frontmatter", () => {
 		const agent: AgentConfig = {

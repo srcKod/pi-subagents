@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { encodeNestedPathEnv, parseNestedPathEnv, type NestedPathEntry } from "./nested-path.ts";
 import { resolveMcpDirectToolNames } from "./mcp-direct-tool-allowlist.ts";
+import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "./structured-output.ts";
+import type { JsonSchemaObject } from "../../shared/types.ts";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const TASK_ARG_LIMIT = 8000;
@@ -54,6 +56,11 @@ interface BuildPiArgsInput {
 	parentDepth?: number;
 	parentPath?: NestedPathEntry[];
 	parentCapabilityToken?: string;
+	structuredOutput?: {
+		schema: JsonSchemaObject;
+		schemaPath: string;
+		outputPath: string;
+	};
 }
 
 interface BuildPiArgsResult {
@@ -203,6 +210,10 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		env.MCP_DIRECT_TOOLS = input.mcpDirectTools.join(",");
 	} else {
 		env.MCP_DIRECT_TOOLS = "__none__";
+	}
+	if (input.structuredOutput) {
+		env[STRUCTURED_OUTPUT_CAPTURE_ENV] = input.structuredOutput.outputPath;
+		env[STRUCTURED_OUTPUT_SCHEMA_ENV] = input.structuredOutput.schemaPath;
 	}
 
 	return { args, env, tempDir };

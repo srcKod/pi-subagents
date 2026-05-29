@@ -12,6 +12,10 @@ import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-
 interface AsyncRunStepSummary {
 	index: number;
 	agent: string;
+	label?: string;
+	phase?: string;
+	outputName?: string;
+	structured?: boolean;
 	status: AsyncJobStep["status"];
 	activityState?: ActivityState;
 	lastActivityAt?: number;
@@ -139,6 +143,10 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		return {
 			index,
 			agent: step.agent,
+			...(step.label ? { label: step.label } : {}),
+			...(step.phase ? { phase: step.phase } : {}),
+			...(step.outputName ? { outputName: step.outputName } : {}),
+			...(step.structured ? { structured: step.structured } : {}),
 			status: step.status,
 			...(stepActivityState ? { activityState: stepActivityState } : {}),
 			...(stepLastActivityAt ? { lastActivityAt: stepLastActivityAt } : {}),
@@ -259,7 +267,9 @@ function formatActivityFacts(input: { activityState?: ActivityState; lastActivit
 }
 
 function formatStepLine(step: AsyncRunStepSummary): string {
-	const parts = [`${step.index + 1}. ${step.agent}`, step.status];
+	const display = step.label ? `${step.label} (${step.agent})` : step.agent;
+	const phase = step.phase ? `[${step.phase}] ` : "";
+	const parts = [`${step.index + 1}. ${phase}${display}`, step.status];
 	const activity = formatActivityFacts(step);
 	if (activity) parts.push(activity);
 	const modelThinking = formatModelThinking(step.model, step.thinking);

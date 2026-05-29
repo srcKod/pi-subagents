@@ -6,10 +6,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { OutputMode } from "../shared/types.ts";
+import type { AcceptanceInput, OutputMode } from "../shared/types.ts";
 import { getAgentDir } from "../shared/utils.ts";
 import { KNOWN_FIELDS } from "./agent-serializer.ts";
-import { parseChain } from "./chain-serializer.ts";
+import { parseChain, parseJsonChain } from "./chain-serializer.ts";
 import { mergeAgentsForScope } from "./agent-selection.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { buildRuntimeName, parsePackageName } from "./identity.ts";
@@ -108,14 +108,25 @@ interface SubagentSettings {
 const EMPTY_SUBAGENT_SETTINGS: SubagentSettings = { overrides: {} };
 
 export interface ChainStepConfig {
-	agent: string;
-	task: string;
+	agent?: string;
+	task?: string;
+	phase?: string;
+	label?: string;
+	as?: string;
+	outputSchema?: string | Record<string, unknown>;
 	output?: string | false;
 	outputMode?: OutputMode;
 	reads?: string[] | false;
 	model?: string;
 	skills?: string[] | false;
 	progress?: boolean;
+	parallel?: unknown;
+	expand?: unknown;
+	collect?: unknown;
+	concurrency?: number;
+	failFast?: boolean;
+	worktree?: boolean;
+	acceptance?: AcceptanceInput;
 }
 
 export interface ChainConfig {
@@ -127,6 +138,12 @@ export interface ChainConfig {
 	filePath: string;
 	steps: ChainStepConfig[];
 	extraFields?: Record<string, string>;
+}
+
+export interface ChainDiscoveryDiagnostic {
+	source: "user" | "project";
+	filePath: string;
+	error: string;
 }
 
 interface AgentDiscoveryResult {
@@ -535,7 +552,7 @@ export function removeBuiltinAgentOverride(cwd: string, name: string, scope: "us
 	return filePath;
 }
 
-function listMarkdownFilesRecursive(dir: string, predicate: (fileName: string) => boolean): string[] {
+function listFilesRecursive(dir: string, predicate: (fileName: string) => boolean): string[] {
 	const files: string[] = [];
 	if (!fs.existsSync(dir)) return files;
 
@@ -549,7 +566,7 @@ function listMarkdownFilesRecursive(dir: string, predicate: (fileName: string) =
 	for (const entry of entries) {
 		const filePath = path.join(dir, entry.name);
 		if (entry.isDirectory()) {
-			files.push(...listMarkdownFilesRecursive(filePath, predicate));
+			files.push(...listFilesRecursive(filePath, predicate));
 			continue;
 		}
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
@@ -562,7 +579,7 @@ function listMarkdownFilesRecursive(dir: string, predicate: (fileName: string) =
 function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
-	for (const filePath of listMarkdownFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"))) {
+	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"))) {
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");
@@ -689,10 +706,11 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	return agents;
 }
 
-function loadChainsFromDir(dir: string, source: AgentSource): ChainConfig[] {
-	const chains: ChainConfig[] = [];
+function loadChainsFromDir(dir: string, source: "user" | "project"): { chains: ChainConfig[]; diagnostics: ChainDiscoveryDiagnostic[] } {
+	const chains = new Map<string, ChainConfig>();
+	const diagnostics: ChainDiscoveryDiagnostic[] = [];
 
-	for (const filePath of listMarkdownFilesRecursive(dir, (fileName) => fileName.endsWith(".chain.md"))) {
+	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".chain.md") || fileName.endsWith(".chain.json"))) {
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");
@@ -701,13 +719,17 @@ function loadChainsFromDir(dir: string, source: AgentSource): ChainConfig[] {
 		}
 
 		try {
-			chains.push(parseChain(content, source, filePath));
-		} catch {
+			const chain = filePath.endsWith(".chain.json") ? parseJsonChain(content, source, filePath) : parseChain(content, source, filePath);
+			const existing = chains.get(chain.name);
+			if (existing && existing.filePath.endsWith(".chain.json") && filePath.endsWith(".chain.md")) continue;
+			chains.set(chain.name, chain);
+		} catch (error) {
+			diagnostics.push({ source, filePath, error: error instanceof Error ? error.message : String(error) });
 			continue;
 		}
 	}
 
-	return chains;
+	return { chains: Array.from(chains.values()), diagnostics };
 }
 
 function isDirectory(p: string): boolean {
@@ -779,6 +801,7 @@ export function discoverAgentsAll(cwd: string): {
 	user: AgentConfig[];
 	project: AgentConfig[];
 	chains: ChainConfig[];
+	chainDiagnostics: ChainDiscoveryDiagnostic[];
 	userDir: string;
 	projectDir: string | null;
 	userChainDir: string;
@@ -816,17 +839,25 @@ export function discoverAgentsAll(cwd: string): {
 	const project = Array.from(projectMap.values());
 
 	const chainMap = new Map<string, ChainConfig>();
+	const projectChainDiagnostics: ChainDiscoveryDiagnostic[] = [];
 	for (const dir of projectChainDirs) {
-		for (const chain of loadChainsFromDir(dir, "project")) {
+		const loaded = loadChainsFromDir(dir, "project");
+		projectChainDiagnostics.push(...loaded.diagnostics);
+		for (const chain of loaded.chains) {
 			chainMap.set(chain.name, chain);
 		}
 	}
+	const userChains = loadChainsFromDir(userChainDir, "user");
 	const chains = [
-		...loadChainsFromDir(userChainDir, "user"),
+		...userChains.chains,
 		...Array.from(chainMap.values()),
+	];
+	const chainDiagnostics = [
+		...userChains.diagnostics,
+		...projectChainDiagnostics,
 	];
 
 	const userDir = process.env.PI_CODING_AGENT_DIR ? userDirOld : fs.existsSync(userDirNew) ? userDirNew : userDirOld;
 
-	return { builtin, user, project, chains, userDir, projectDir, userChainDir, projectChainDir, userSettingsPath, projectSettingsPath };
+	return { builtin, user, project, chains, chainDiagnostics, userDir, projectDir, userChainDir, projectChainDir, userSettingsPath, projectSettingsPath };
 }

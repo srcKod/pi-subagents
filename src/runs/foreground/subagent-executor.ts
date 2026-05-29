@@ -21,6 +21,7 @@ import {
 	writeInitialProgressFile,
 	getStepAgents,
 	isParallelStep,
+	isDynamicParallelStep,
 	resolveStepBehavior,
 	suppressProgressForReadOnlyTask,
 	taskDisallowsFileUpdates,
@@ -63,6 +64,7 @@ import {
 } from "../shared/worktree.ts";
 import {
 	type AgentProgress,
+	type AcceptanceInput,
 	type ArtifactConfig,
 	type ArtifactPaths,
 	type ControlConfig,
@@ -103,6 +105,7 @@ interface TaskParam {
 	progress?: boolean;
 	model?: string;
 	skill?: string | string[] | boolean;
+	acceptance?: AcceptanceInput;
 }
 
 export interface SubagentParamsLike {
@@ -134,6 +137,7 @@ export interface SubagentParamsLike {
 	outputMode?: "inline" | "file-only";
 	agentScope?: unknown;
 	chainDir?: string;
+	acceptance?: AcceptanceInput;
 }
 
 interface ExecutorDeps {
@@ -816,6 +820,12 @@ function validateExecutionInput(
 					details: { mode: "chain" as const, results: [] },
 				};
 			}
+		} else if (isDynamicParallelStep(firstStep)) {
+			return {
+				content: [{ type: "text", text: "First step in chain cannot be dynamic fanout; expand.from requires a prior structured named output" }],
+				isError: true,
+				details: { mode: "chain" as const, results: [] },
+			};
 		} else if (!(firstStep as SequentialStep).task && !params.task && !allowClarifyTaskPrompt) {
 			return {
 				content: [{ type: "text", text: "First step in chain must have a task" }],
@@ -977,6 +987,10 @@ function collectChainSessionFiles(
 			}
 			continue;
 		}
+		if (isDynamicParallelStep(step)) {
+			sessionFiles.push(undefined);
+			continue;
+		}
 		sessionFiles.push(sessionFileForIndex(flatIndex));
 		flatIndex++;
 	}
@@ -993,6 +1007,15 @@ function wrapChainTasksForFork(chain: ChainStep[], context: SubagentParamsLike["
 					...task,
 					task: wrapForkTask(task.task ?? "{previous}"),
 				})),
+			};
+		}
+		if (isDynamicParallelStep(step)) {
+			return {
+				...step,
+				parallel: {
+					...step.parallel,
+					task: wrapForkTask(step.parallel.task ?? "{previous}"),
+				},
 			};
 		}
 		const sequential = step as SequentialStep;
@@ -1082,6 +1105,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			...(task.outputMode !== undefined ? { outputMode: task.outputMode } : {}),
 			...(task.reads !== undefined && task.reads !== true ? { reads: task.reads } : {}),
 			...(task.progress !== undefined ? { progress: task.progress } : {}),
+			...(task.acceptance !== undefined ? { acceptance: task.acceptance } : {}),
 		}));
 		return executeAsyncChain(id, {
 			chain: [{
@@ -1129,6 +1153,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sessionRoot,
 			chainSkills,
 			sessionFilesByFlatIndex: collectChainSessionFiles(chain, sessionFileForIndex),
+			dynamicFanoutMaxItems: deps.config.chain?.dynamicFanout?.maxItems,
 			maxSubagentDepth: currentMaxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
 			worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
@@ -1179,6 +1204,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			controlIntercomTarget,
 			childIntercomTarget: childIntercomTarget ? (agent, index) => childIntercomTarget(agent, index) : undefined,
 			nestedRoute,
+			acceptance: params.acceptance,
 		});
 	}
 
@@ -1234,6 +1260,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		nestedRoute: foregroundControl?.nestedRoute,
 		chainSkills,
 		chainDir: params.chainDir,
+		dynamicFanoutMaxItems: deps.config.chain?.dynamicFanout?.maxItems,
 		maxSubagentDepth: currentMaxSubagentDepth,
 		worktreeSetupHook: deps.config.worktreeSetupHook,
 		worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
@@ -1269,6 +1296,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			sessionRoot,
 			chainSkills: chainResult.requestedAsync.chainSkills,
 			sessionFilesByFlatIndex: collectChainSessionFiles(asyncChain, sessionFileForIndex),
+			dynamicFanoutMaxItems: deps.config.chain?.dynamicFanout?.maxItems,
 			maxSubagentDepth: currentMaxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
 			worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
@@ -1491,6 +1519,8 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			availableModels: input.availableModels,
 			preferredModelProvider: input.ctx.model?.provider,
 			skills: effectiveSkills === false ? [] : effectiveSkills,
+			acceptance: task.acceptance,
+			acceptanceContext: { mode: "parallel" },
 				onUpdate: input.onUpdate
 					? (progressUpdate) => {
 						const stepResults = progressUpdate.details?.results || [];
@@ -1680,6 +1710,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 					...(behaviorOverrides[i]?.outputMode !== undefined ? { outputMode: behaviorOverrides[i]!.outputMode } : {}),
 					...(behaviorOverrides[i]?.reads !== undefined ? { reads: behaviorOverrides[i]!.reads } : {}),
 					...(progress !== undefined ? { progress } : {}),
+					...(t.acceptance !== undefined ? { acceptance: t.acceptance } : {}),
 				};
 			});
 			return executeAsyncChain(id, {
@@ -2053,6 +2084,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		availableModels,
 		preferredModelProvider: currentProvider,
 		skills: effectiveSkills,
+		acceptance: params.acceptance,
+		acceptanceContext: { mode: "single" },
 	});
 	if (foregroundControl?.currentIndex === 0) {
 		foregroundControl.interrupt = undefined;

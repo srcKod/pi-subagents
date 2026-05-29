@@ -12,7 +12,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { applyThinkingSuffix } from "../shared/pi-args.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
-import { buildChainInstructions, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
+import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
 import { resolvePiPackageRoot } from "../shared/pi-spawn.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
@@ -20,7 +20,12 @@ import { resolveChildCwd } from "../../shared/utils.ts";
 import { buildModelCandidates, resolveModelCandidate, type AvailableModelInfo } from "../shared/model-fallback.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { resolveExpectedWorktreeAgentCwd } from "../shared/worktree.ts";
+import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
+import { ChainOutputValidationError, validateChainOutputBindings } from "../shared/chain-outputs.ts";
+import { createStructuredOutputRuntime } from "../shared/structured-output.ts";
+import { resolveEffectiveAcceptance } from "../shared/acceptance.ts";
 import {
+	type AcceptanceInput,
 	type ArtifactConfig,
 	type Details,
 	type MaxOutputConfig,
@@ -107,6 +112,7 @@ interface AsyncChainParams {
 	sessionRoot?: string;
 	chainSkills?: string[];
 	sessionFilesByFlatIndex?: (string | undefined)[];
+	dynamicFanoutMaxItems?: number;
 	maxSubagentDepth: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
@@ -114,6 +120,7 @@ interface AsyncChainParams {
 	controlIntercomTarget?: string;
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 	nestedRoute?: NestedRouteInfo;
+	acceptance?: AcceptanceInput;
 }
 
 interface AsyncSingleParams {
@@ -140,6 +147,7 @@ interface AsyncSingleParams {
 	controlIntercomTarget?: string;
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 	nestedRoute?: NestedRouteInfo;
+	acceptance?: AcceptanceInput;
 }
 
 interface AsyncExecutionResult {
@@ -248,12 +256,25 @@ export function executeAsyncChain(
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
 	const firstStep = chain[0];
 	const originalTask = params.task ?? (firstStep
-		? (isParallelStep(firstStep) ? firstStep.parallel[0]?.task : (firstStep as SequentialStep).task)
+		? (isParallelStep(firstStep)
+			? firstStep.parallel[0]?.task
+			: isDynamicParallelStep(firstStep)
+				? firstStep.parallel.task
+				: (firstStep as SequentialStep).task)
 		: undefined);
+	try {
+		validateChainOutputBindings(chain, { maxItems: params.dynamicFanoutMaxItems });
+	} catch (error) {
+		if (error instanceof ChainOutputValidationError) return formatAsyncStartError(resultMode, error.message);
+		throw error;
+	}
+	const workflowGraph = buildWorkflowGraphSnapshot({ runId: id, mode: resultMode, steps: chain });
 
 	for (const s of chain) {
 		const stepAgents = isParallelStep(s)
 			? s.parallel.map((t) => t.agent)
+			: isDynamicParallelStep(s)
+				? [s.parallel.agent]
 			: [(s as SequentialStep).agent];
 		for (const agentName of stepAgents) {
 			if (!agents.find((x) => x.name === agentName)) {
@@ -316,13 +337,20 @@ export function executeAsyncChain(
 		const outputPath = resolveSingleOutputPath(behavior.output, ctx.cwd, instructionCwd);
 		const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath, `Async step (${s.agent})`);
 		if (validationError) throw new AsyncStartValidationError(validationError);
-		const task = injectSingleOutputInstruction(`${readInstructions.prefix}${s.task ?? "{previous}"}${progressInstructions.suffix}`, outputPath);
+		let taskTemplate = s.task ?? "{previous}";
+		taskTemplate = taskTemplate.replace(/\{task\}/g, originalTask ?? "");
+		taskTemplate = taskTemplate.replace(/\{chain_dir\}/g, runnerCwd);
+		const task = injectSingleOutputInstruction(`${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`, outputPath);
 
 		const primaryModel = resolveModelCandidate(behavior.model ?? a.model, availableModels, ctx.currentModelProvider);
 		const model = applyThinkingSuffix(primaryModel, a.thinking);
 		return {
 			agent: s.agent,
 			task,
+			phase: s.phase,
+			label: s.label,
+			outputName: s.as,
+			structured: Boolean(s.outputSchema),
 			cwd: stepCwd,
 			model,
 			thinking: resolveEffectiveThinking(model, a.thinking),
@@ -342,6 +370,16 @@ export function executeAsyncChain(
 			outputMode: behavior.outputMode,
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
+			effectiveAcceptance: resolveEffectiveAcceptance({
+				explicit: s.acceptance,
+				agentName: s.agent,
+				task: s.task,
+				mode: resultMode,
+				async: true,
+				dynamic: false,
+			}),
+			...(s.outputSchema ? { structuredOutputSchema: s.outputSchema } : {}),
+			...(s.outputSchema ? { structuredOutput: createStructuredOutputRuntime(s.outputSchema, path.join(asyncDir, "structured-output")) } : {}),
 		};
 	};
 
@@ -382,6 +420,32 @@ export function executeAsyncChain(
 					worktree: s.worktree,
 				};
 			}
+			if (isDynamicParallelStep(s)) {
+				const agent = agents.find((candidate) => candidate.name === s.parallel.agent)!;
+				const behavior = suppressProgressForReadOnlyTask(resolveStepBehavior(agent, buildStepOverrides(s.parallel), chainSkills), s.parallel.task, originalTask);
+				const progressPrecreated = behavior.progress;
+				if (progressPrecreated) {
+					writeInitialProgressFile(runnerCwd);
+					progressInstructionCreated = true;
+				}
+				return {
+					expand: s.expand,
+					parallel: buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior),
+					collect: s.collect,
+					concurrency: s.concurrency,
+					failFast: s.failFast,
+					phase: s.phase,
+					label: s.label,
+					effectiveAcceptance: resolveEffectiveAcceptance({
+						explicit: s.acceptance,
+						agentName: s.parallel.agent,
+						task: s.parallel.task,
+						mode: resultMode,
+						async: true,
+						dynamicGroup: true,
+					}),
+				};
+			}
 			return buildSeqStep(s as SequentialStep, nextSessionFile());
 		});
 	} catch (error) {
@@ -391,6 +455,10 @@ export function executeAsyncChain(
 	let childTargetIndex = 0;
 	const childIntercomTargets = childIntercomTarget ? steps.flatMap((step) => {
 		if ("parallel" in step) {
+			if (!Array.isArray(step.parallel)) {
+				childTargetIndex++;
+				return [undefined];
+			}
 			return step.parallel.map((task) => childIntercomTarget(task.agent, childTargetIndex++));
 		}
 		return [childIntercomTarget(step.agent, childTargetIndex++)];
@@ -420,6 +488,8 @@ export function executeAsyncChain(
 				controlIntercomTarget,
 				childIntercomTargets,
 				resultMode,
+				dynamicFanoutMaxItems: params.dynamicFanoutMaxItems,
+				workflowGraph,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
@@ -444,6 +514,8 @@ export function executeAsyncChain(
 		const firstStep = chain[0];
 		const firstAgents = isParallelStep(firstStep)
 			? firstStep.parallel.map((t) => t.agent)
+			: isDynamicParallelStep(firstStep)
+				? [firstStep.parallel.agent]
 			: [(firstStep as SequentialStep).agent];
 		const parallelGroups: Array<{ start: number; count: number; stepIndex: number }> = [];
 		const flatAgents: string[] = [];
@@ -454,6 +526,10 @@ export function executeAsyncChain(
 				parallelGroups.push({ start: flatStepStart, count: step.parallel.length, stepIndex });
 				flatAgents.push(...step.parallel.map((task) => task.agent));
 				flatStepStart += step.parallel.length;
+			} else if (isDynamicParallelStep(step)) {
+				parallelGroups.push({ start: flatStepStart, count: 1, stepIndex });
+				flatAgents.push(step.parallel.agent);
+				flatStepStart++;
 			} else {
 				flatAgents.push((step as SequentialStep).agent);
 				flatStepStart++;
@@ -502,12 +578,15 @@ export function executeAsyncChain(
 			agents: flatAgents,
 			task: isParallelStep(firstStep)
 				? firstStep.parallel[0]?.task?.slice(0, 50)
+				: isDynamicParallelStep(firstStep)
+					? firstStep.parallel.task?.slice(0, 50)
 				: (firstStep as SequentialStep).task?.slice(0, 50),
 			chain: chain.map((s) =>
-				isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : (s as SequentialStep).agent,
+				isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : isDynamicParallelStep(s) ? `expand:${s.parallel.agent}` : (s as SequentialStep).agent,
 			),
 			chainStepCount: chain.length,
 			parallelGroups,
+			workflowGraph,
 			cwd: runnerCwd,
 			asyncDir,
 			nestedRoute,
@@ -516,13 +595,13 @@ export function executeAsyncChain(
 
 	const chainDesc = chain
 		.map((s) =>
-			isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : (s as SequentialStep).agent,
+			isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : isDynamicParallelStep(s) ? `expand:${s.parallel.agent}` : (s as SequentialStep).agent,
 		)
 		.join(" -> ");
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`) }],
-		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir },
+		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph },
 	};
 }
 
@@ -618,6 +697,13 @@ export function executeAsyncSingle(
 						outputMode,
 						sessionFile,
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
+						effectiveAcceptance: resolveEffectiveAcceptance({
+							explicit: params.acceptance,
+							agentName: agent,
+							task,
+							mode: "single",
+							async: true,
+						}),
 					},
 				],
 				resultPath: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : path.join(RESULTS_DIR, `${id}.json`),
