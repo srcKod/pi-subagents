@@ -14,14 +14,18 @@ import {
 
 let tempDir = "";
 
-function makeProjectSkill(cwd: string, name: string, body: string, description = "Test description"): void {
-	const skillDir = path.join(cwd, ".pi", "skills", name);
+function writeSkillFile(skillDir: string, body: string, description = "Test description"): void {
 	fs.mkdirSync(skillDir, { recursive: true });
 	fs.writeFileSync(
 		path.join(skillDir, "SKILL.md"),
 		`---\ndescription: ${description}\n---\n\n${body}\n`,
 		"utf-8",
 	);
+}
+
+function makeProjectSkill(cwd: string, name: string, body: string, description = "Test description"): void {
+	const skillDir = path.join(cwd, ".pi", "skills", name);
+	writeSkillFile(skillDir, body, description);
 }
 
 function makeProjectPackageSkill(cwd: string, packageName: string, name: string, body: string): void {
@@ -66,6 +70,66 @@ describe("skills filesystem fallback", () => {
 		assert.ok(discovered, "expected fallback-skill to be discovered");
 		assert.equal(discovered?.source, "project");
 		assert.equal(discovered?.description, "Test description");
+	});
+
+	it("discovers project skills nested below grouping directories", () => {
+		writeSkillFile(
+			path.join(tempDir, ".pi", "skills", "shell", "issue-262-nested-skill"),
+			"Use nested project skill.",
+			"Nested issue 262 skill",
+		);
+
+		const skills = discoverAvailableSkills(tempDir);
+		const discovered = skills.find((skill) => skill.name === "issue-262-nested-skill");
+		assert.ok(discovered, "expected grouped nested skill to be discovered");
+		assert.equal(discovered?.source, "project");
+		assert.equal(discovered?.description, "Nested issue 262 skill");
+
+		const { resolved, missing } = resolveSkills(["issue-262-nested-skill"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.equal(resolved.length, 1);
+		assert.match(resolved[0]?.content ?? "", /Use nested project skill\./);
+	});
+
+	it("stops recursive project skill discovery at the first SKILL.md anchor", () => {
+		const groupedRoot = path.join(tempDir, ".pi", "skills", "group");
+		writeSkillFile(path.join(groupedRoot, "issue-262-anchor"), "Use anchor skill.");
+		writeSkillFile(path.join(groupedRoot, "issue-262-anchor", "nested", "issue-262-leaked-skill"), "Should not leak.");
+		writeSkillFile(path.join(groupedRoot, "issue-262-sibling"), "Use sibling skill.");
+
+		const names = discoverAvailableSkills(tempDir).map((skill) => skill.name);
+		assert.equal(names.includes("issue-262-anchor"), true);
+		assert.equal(names.includes("issue-262-sibling"), true);
+		assert.equal(names.includes("issue-262-leaked-skill"), false);
+	});
+
+	it("skips hidden directories and node_modules while recursing for project skills", () => {
+		const groupedRoot = path.join(tempDir, ".pi", "skills", "group");
+		writeSkillFile(path.join(groupedRoot, ".hidden", "issue-262-hidden-skill"), "Should stay hidden.");
+		writeSkillFile(path.join(groupedRoot, "node_modules", "issue-262-node-skill"), "Should stay ignored.");
+		writeSkillFile(path.join(groupedRoot, "visible", "issue-262-visible-skill"), "Use visible nested skill.");
+
+		const names = discoverAvailableSkills(tempDir).map((skill) => skill.name);
+		assert.equal(names.includes("issue-262-visible-skill"), true);
+		assert.equal(names.includes("issue-262-hidden-skill"), false);
+		assert.equal(names.includes("issue-262-node-skill"), false);
+	});
+
+	it("keeps direct markdown skills from explicit settings roots after parent recursion", () => {
+		const groupedRoot = path.join(tempDir, ".pi", "skills", "group");
+		fs.mkdirSync(groupedRoot, { recursive: true });
+		fs.writeFileSync(path.join(groupedRoot, "issue-262-direct.md"), "Use direct markdown skill.\n", "utf-8");
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ skills: ["./skills/group"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(["issue-262-direct"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.equal(resolved.length, 1);
+		assert.equal(resolved[0]?.source, "project-settings");
+		assert.match(resolved[0]?.content ?? "", /Use direct markdown skill\./);
 	});
 
 	it("resolves and reads skill content via filesystem fallback", () => {

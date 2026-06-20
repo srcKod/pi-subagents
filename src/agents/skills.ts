@@ -395,6 +395,7 @@ function maybeReadSkillDescription(filePath: string): string | undefined {
 function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: SkillSearchPath[]): CachedSkillEntry[] {
 	const entries: CachedSkillEntry[] = [];
 	const seen = new Set<string>();
+	const visitedDirectories = new Set<string>();
 	let order = 0;
 
 	const pushEntry = (name: string, filePath: string, sourceHint?: SkillSource) => {
@@ -409,6 +410,53 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 			description: maybeReadSkillDescription(resolvedFile),
 			order: order++,
 		});
+	};
+
+	const shouldSkipDirectory = (name: string) => name.startsWith(".") || name === "node_modules";
+
+	const markDirectoryVisited = (dirPath: string): boolean => {
+		let resolvedDir: string;
+		try {
+			resolvedDir = fs.realpathSync(dirPath);
+		} catch {
+			resolvedDir = path.resolve(dirPath);
+		}
+		if (visitedDirectories.has(resolvedDir)) return false;
+		visitedDirectories.add(resolvedDir);
+		return true;
+	};
+
+	const walkSkillDirectories = (dirPath: string, sourceHint?: SkillSource) => {
+		if (!markDirectoryVisited(dirPath)) return;
+
+		const skillFile = path.join(dirPath, "SKILL.md");
+		if (fs.existsSync(skillFile)) {
+			pushEntry(path.basename(dirPath), skillFile, sourceHint);
+			return;
+		}
+
+		let entriesInDir: fs.Dirent[];
+		try {
+			entriesInDir = fs.readdirSync(dirPath, { withFileTypes: true });
+		} catch {
+			return;
+		}
+
+		for (const entry of entriesInDir) {
+			if (shouldSkipDirectory(entry.name)) continue;
+			if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+
+			const entryPath = path.join(dirPath, entry.name);
+			let stat: fs.Stats;
+			try {
+				stat = fs.statSync(entryPath);
+			} catch {
+				continue;
+			}
+			if (stat.isDirectory()) {
+				walkSkillDirectories(entryPath, sourceHint);
+			}
+		}
 	};
 
 	for (const skillPath of skillPaths) {
@@ -436,7 +484,10 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 		const rootSkillFile = path.join(skillPath.path, "SKILL.md");
 		if (fs.existsSync(rootSkillFile)) {
 			pushEntry(path.basename(skillPath.path), rootSkillFile, skillPath.source);
+			continue;
 		}
+
+		markDirectoryVisited(skillPath.path);
 
 		let childEntries: fs.Dirent[];
 		try {
@@ -449,10 +500,14 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 			if (child.name.startsWith(".")) continue;
 			const childPath = path.join(skillPath.path, child.name);
 			if (child.isDirectory() || child.isSymbolicLink()) {
-				const nestedSkillPath = path.join(childPath, "SKILL.md");
-				if (fs.existsSync(nestedSkillPath)) {
-					pushEntry(child.name, nestedSkillPath, skillPath.source);
+				if (shouldSkipDirectory(child.name)) continue;
+				let childStat: fs.Stats;
+				try {
+					childStat = fs.statSync(childPath);
+				} catch {
+					continue;
 				}
+				if (childStat.isDirectory()) walkSkillDirectories(childPath, skillPath.source);
 				continue;
 			}
 			if (child.isFile() && child.name.toLowerCase().endsWith(".md")) {
