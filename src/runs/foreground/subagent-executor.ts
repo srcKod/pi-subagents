@@ -50,6 +50,7 @@ import {
 	stripDetailsOutputsForIntercomReceipt,
 } from "../../intercom/result-intercom.ts";
 import { buildRevivedAsyncTask, interruptLiveAsyncResumeTarget, resolveAsyncResumeTarget } from "../background/async-resume.ts";
+import { resolveAsyncRootResultPath } from "../background/chain-root-attachment.ts";
 import { createNestedRoute, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
@@ -81,7 +82,9 @@ import {
 	type SingleResult,
 	type SubagentRunMode,
 	type SubagentState,
+	ASYNC_DIR,
 	DEFAULT_ARTIFACT_CONFIG,
+	RESULTS_DIR,
 	SUBAGENT_ACTIONS,
 	SUBAGENT_CONTROL_EVENT,
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
@@ -320,7 +323,7 @@ function isExactResumeError(error: unknown, source: "async" | "foreground", requ
 	return new RegExp(`\\b${source} run '${escapeRegExp(requested)}'`, "i").test(error.message);
 }
 
-function resolveResumeTarget(params: SubagentParamsLike, state: SubagentState): ResumeSourceTarget {
+function resolveResumeTarget(params: SubagentParamsLike, state: SubagentState, options: { asyncRequireSessionFile?: boolean } = {}): ResumeSourceTarget {
 	const requested = (params.id ?? params.runId)?.trim() ?? "";
 	let foregroundTarget: ForegroundResumeSourceTarget | undefined;
 	let foregroundError: unknown;
@@ -334,7 +337,7 @@ function resolveResumeTarget(params: SubagentParamsLike, state: SubagentState): 
 		foregroundError = error;
 	}
 	try {
-		asyncTarget = { source: "async", ...resolveAsyncResumeTarget(params) };
+		asyncTarget = { source: "async", ...resolveAsyncResumeTarget(params, {}, { requireSessionFile: options.asyncRequireSessionFile }) };
 	} catch (error) {
 		asyncError = error;
 	}
@@ -737,7 +740,8 @@ async function resumeAsyncRun(input: {
 	deps: ExecutorDeps;
 }): Promise<AgentToolResult<Details>> {
 	const followUp = (input.params.message ?? input.params.task ?? "").trim();
-	if (!followUp) {
+	const attachChain = (input.params.chain?.length ?? 0) > 0 ? input.params.chain as ChainStep[] : undefined;
+	if (!followUp && !attachChain) {
 		return {
 			content: [{ type: "text", text: "action='resume' requires message." }],
 			isError: true,
@@ -751,6 +755,13 @@ async function resumeAsyncRun(input: {
 		const requestedId = input.params.id ?? input.params.runId;
 		const resolved = requestedId ? resolveSubagentRunId(requestedId, { state: input.deps.state, nested: nestedResolutionScopeForExecutor(input.deps) }) : undefined;
 		if (resolved?.kind === "nested") {
+			if (attachChain) {
+				return {
+					content: [{ type: "text", text: "Attaching a running subagent as a chain root is currently available for top-level async runs only." }],
+					isError: true,
+					details: { mode: "management", results: [] },
+				};
+			}
 			if (resolved.match.run.state === "running" || resolved.match.run.state === "queued") {
 				return resumeLiveNestedRun({ target: resolved, message: followUp });
 			}
@@ -760,14 +771,14 @@ async function resumeAsyncRun(input: {
 			];
 			target = resolveNestedResumeTarget(resolved, trustedSessionRoots);
 		} else {
-			target = resolveResumeTarget(input.params, input.deps.state);
+			target = resolveResumeTarget(input.params, input.deps.state, { asyncRequireSessionFile: !attachChain });
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
 	}
 
-	if (target.kind === "live") {
+	if (target.kind === "live" && !attachChain) {
 		const interrupt = interruptLiveAsyncResumeTarget({
 			target,
 			state: input.deps.state,
@@ -830,6 +841,73 @@ async function resumeAsyncRun(input: {
 			isError: true,
 			details: { mode: "management", results: [] },
 		};
+	}
+
+	if (attachChain) {
+		if (target.source !== "async") {
+			return {
+				content: [{ type: "text", text: "Attaching a running subagent as a chain root is currently available for async runs only." }],
+				isError: true,
+				details: { mode: "management", results: [] },
+			};
+		}
+		if (!isAsyncAvailable()) {
+			return {
+				content: [{ type: "text", text: "Async mode requires upstream jiti for TypeScript execution but it could not be found. Ensure the pi-subagents package dependencies are installed." }],
+				isError: true,
+				details: { mode: "chain", results: [] },
+			};
+		}
+		const runId = randomUUID().slice(0, 8);
+		const artifactConfig: ArtifactConfig = { ...DEFAULT_ARTIFACT_CONFIG, enabled: input.params.artifacts !== false };
+		const availableModels = input.ctx.modelRegistry.getAvailable().map(toModelInfo);
+		const chain = wrapChainTasksForFork(attachChain, input.params.context);
+		const normalized = normalizeSkillInput(input.params.skill);
+		const result = executeAsyncChain(runId, {
+			chain,
+			task: (input.params.task ?? followUp) || undefined,
+			attachRoot: {
+				runId: target.runId,
+				asyncDir: target.asyncDir ?? path.join(ASYNC_DIR, target.runId),
+				resultPath: resolveAsyncRootResultPath(RESULTS_DIR, target.runId),
+				index: target.index,
+				agent: target.agent,
+				label: `Attached ${target.runId}`,
+			},
+			agents,
+			ctx: {
+				pi: input.deps.pi,
+				cwd: input.requestCwd,
+				currentSessionId: input.deps.state.currentSessionId,
+				currentModelProvider: input.ctx.model?.provider,
+				currentModel: input.ctx.model,
+			},
+			availableModels,
+			cwd: effectiveCwd,
+			maxOutput: input.params.maxOutput,
+			artifactsDir: input.deps.tempArtifactsDir,
+			artifactConfig,
+			shareEnabled: input.params.share === true,
+			sessionRoot: input.deps.getSubagentSessionRoot(parentSessionFile),
+			chainSkills: normalized === false ? [] : (normalized ?? []),
+			dynamicFanoutMaxItems: input.deps.config.chain?.dynamicFanout?.maxItems,
+			maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth),
+			worktreeSetupHook: input.deps.config.worktreeSetupHook,
+			worktreeSetupHookTimeoutMs: input.deps.config.worktreeSetupHookTimeoutMs,
+			controlConfig: resolveControlConfig(input.deps.config.control, input.params.control),
+			controlIntercomTarget: intercomBridge.active ? intercomBridge.orchestratorTarget : undefined,
+			childIntercomTarget: intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(runId, agent, index) : undefined,
+		});
+		if (result.isError) return result;
+		const attachedId = result.details.asyncId ?? runId;
+		const lines = [
+			`Attached async subagent ${target.runId} as the first step of a new chain.`,
+			`Chain run: ${attachedId}`,
+			`Root: ${target.agent} (step ${target.index + 1})`,
+			result.details.asyncDir ? `Async dir: ${result.details.asyncDir}` : undefined,
+			`Status if needed: subagent({ action: "status", id: "${attachedId}" })`,
+		].filter((line): line is string => Boolean(line));
+		return { content: [{ type: "text", text: formatAsyncStartedMessage(lines.join("\n")) }], details: result.details };
 	}
 
 	const runId = randomUUID().slice(0, 8);

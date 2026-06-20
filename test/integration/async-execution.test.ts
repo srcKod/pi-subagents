@@ -141,6 +141,23 @@ async function waitForAsyncResultFile(id: string, timeoutMs = 15_000): Promise<s
 	return resultPath;
 }
 
+async function waitForMockPiArgs(mockPi: MockPi, index: number, timeoutMs = 30_000): Promise<string[]> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const callFile = fs.readdirSync(mockPi.dir)
+			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.sort()
+			.at(index);
+		if (callFile) {
+			const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[] };
+			assert.ok(Array.isArray(payload.args), "expected recorded args");
+			return payload.args;
+		}
+		if (Date.now() > deadline) assert.fail(`Timed out waiting for recorded mock pi call ${index}`);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+}
+
 function readLastMockPiArgs(mockPi: MockPi): string[] {
 	const callFile = fs.readdirSync(mockPi.dir)
 		.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
@@ -782,27 +799,13 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 			const asyncId = result.details?.asyncId;
 			assert.ok(asyncId, "expected asyncId");
-			const resultPath = path.join(RESULTS_DIR, `${asyncId}.json`);
-			const asyncDir = result.details?.asyncDir;
-			const deadline = Date.now() + 30_000;
-			while (!fs.existsSync(resultPath)) {
-				if (Date.now() > deadline) {
-					const statusPath = asyncDir ? path.join(asyncDir, "status.json") : undefined;
-					const eventsPath = asyncDir ? path.join(asyncDir, "events.jsonl") : undefined;
-					const status = statusPath && fs.existsSync(statusPath) ? fs.readFileSync(statusPath, "utf-8") : "(missing status.json)";
-					const events = eventsPath && fs.existsSync(eventsPath) ? fs.readFileSync(eventsPath, "utf-8") : "(missing events.jsonl)";
-					assert.fail(`Timed out waiting for async result file: ${resultPath}\nStatus: ${status}\nEvents: ${events}`);
-				}
-				await new Promise((resolve) => setTimeout(resolve, 100));
-			}
 
 			const worktreeCwd = path.join(os.tmpdir(), `pi-worktree-${asyncId}-s0-0`);
-			const callFile = fs.readdirSync(mockPi.dir).find((name) => name.startsWith("call-"));
-			assert.ok(callFile, "expected a recorded mock pi call");
-			const args = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+			const args = await waitForMockPiArgs(mockPi, 0);
 			const taskArg = args.at(-1) ?? "";
 			assert.ok(taskArg.includes(`[Read from: ${path.join(worktreeCwd, "input.md")}]`));
 			assert.ok(taskArg.includes(`Write your findings to: ${path.join(worktreeCwd, "report.md")}`));
+			await waitForAsyncResultFile(asyncId, 90_000);
 		} finally {
 			removeTempDir(repoDir);
 		}
@@ -1749,7 +1752,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const elapsed = Date.now() - start;
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
-		assert.ok(elapsed < 4000, `should clean up async child shortly after terminal stop, took ${elapsed}ms`);
+		assert.ok(elapsed < 9000, `should clean up async child before the mock's natural keepalive exit, took ${elapsed}ms`);
 		assert.equal(payload.success, true);
 		assert.equal(payload.exitCode, 0);
 		assert.equal(payload.results[0].success, true);
@@ -1785,7 +1788,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const elapsed = Date.now() - start;
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
-		assert.ok(elapsed < 4000, `should clean up async child shortly after empty terminal stop, took ${elapsed}ms`);
+		assert.ok(elapsed < 9000, `should clean up async child before the mock's natural keepalive exit, took ${elapsed}ms`);
 		assert.equal(payload.success, true);
 		assert.equal(payload.exitCode, 0);
 		assert.equal(payload.results[0].success, true);

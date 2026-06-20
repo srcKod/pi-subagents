@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
-import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, RESULTS_DIR } from "../../src/shared/types.ts";
+import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, RESULTS_DIR, SUBAGENT_ASYNC_STARTED_EVENT } from "../../src/shared/types.ts";
 import type { MockPi } from "../support/helpers.ts";
 import {
 	createMockPi,
@@ -122,6 +122,14 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		}
 		assert.ok(callFile, `expected mock pi call at index ${index}`);
 		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+	}
+
+	async function waitForFile(filePath: string, timeoutMs = 10_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!fs.existsSync(filePath)) {
+			if (Date.now() > deadline) assert.fail(`Timed out waiting for file: ${filePath}`);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
 	}
 
 	function makeExecutor(options: { bridgeMode?: "always" | "off"; agents?: ReturnType<typeof makeAgent>[]; acknowledgeResults?: boolean; kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean } = {}) {
@@ -352,6 +360,131 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			assert.match(payload?.message ?? "", /Can you clarify the last change\?/);
 		} finally {
 			fs.rmSync(asyncDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resume action can attach a live async child as the first step of a new chain", async () => {
+		const sourceRunId = `resume-chain-root-${Date.now()}`;
+		const sourceAsyncDir = path.join(ASYNC_DIR, sourceRunId);
+		const sourceResultPath = path.join(RESULTS_DIR, `${sourceRunId}.json`);
+		const sourceSession = path.join(tempDir, "source-child.jsonl");
+		try {
+			fs.mkdirSync(sourceAsyncDir, { recursive: true });
+			fs.mkdirSync(RESULTS_DIR, { recursive: true });
+			fs.writeFileSync(sourceSession, "", "utf-8");
+			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify({
+				runId: sourceRunId,
+				mode: "single",
+				state: "running",
+				pid: process.pid,
+				startedAt: 100,
+				lastUpdate: 100,
+				cwd: tempDir,
+				steps: [{ agent: "worker", status: "running", sessionFile: sourceSession }],
+			}, null, 2), "utf-8");
+			fs.writeFileSync(sourceResultPath, JSON.stringify({
+				id: sourceRunId,
+				agent: "worker",
+				mode: "single",
+				success: true,
+				state: "complete",
+				summary: "root output",
+				results: [{ agent: "worker", output: "root output", success: true, sessionFile: sourceSession }],
+			}, null, 2), "utf-8");
+			const { executor, events } = makeExecutor({ agents: [makeAgent("worker"), makeAgent("reviewer")] });
+
+			const result = await executor.execute(
+				"resume-chain-root",
+				{
+					action: "resume",
+					id: sourceRunId,
+					chain: [{ agent: "reviewer", task: "Review this root result: {previous}" }],
+				},
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.match(result.content[0]?.text ?? "", /Attached async subagent/);
+			const startedEvent = events.emitted.find((entry) => entry.channel === SUBAGENT_ASYNC_STARTED_EVENT)?.payload as { agent?: string; agents?: string[]; chain?: string[]; chainStepCount?: number } | undefined;
+			assert.equal(startedEvent?.agent, "worker");
+			assert.deepEqual(startedEvent?.agents, ["worker", "reviewer"]);
+			assert.deepEqual(startedEvent?.chain, ["worker", "reviewer"]);
+			assert.equal(startedEvent?.chainStepCount, 2);
+			const attachedId = result.details?.asyncId;
+			assert.ok(attachedId, "expected attached chain async id");
+			assert.match(result.details?.asyncDir ?? "", new RegExp(`${attachedId}$`));
+			const statusPath = path.join(result.details!.asyncDir!, "status.json");
+			await waitForFile(statusPath);
+			const attachedStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { mode?: string; chainStepCount?: number; steps?: Array<{ agent?: string; label?: string; status?: string }> };
+			assert.equal(attachedStatus.mode, "chain");
+			assert.equal(attachedStatus.chainStepCount, 2);
+			assert.deepEqual(attachedStatus.steps?.map((step) => step.agent), ["worker", "reviewer"]);
+			assert.match(attachedStatus.steps?.[0]?.label ?? "", /Attached resume-chain-root-/);
+			await waitForFile(path.join(RESULTS_DIR, `${attachedId}.json`));
+		} finally {
+			fs.rmSync(sourceAsyncDir, { recursive: true, force: true });
+			fs.rmSync(sourceResultPath, { force: true });
+		}
+	});
+
+	it("resume action can attach a completed async result without reviving from a session", async () => {
+		const sourceRunId = `resume-chain-complete-root-${Date.now()}`;
+		const sourceAsyncDir = path.join(ASYNC_DIR, sourceRunId);
+		const sourceResultPath = path.join(RESULTS_DIR, `${sourceRunId}.json`);
+		try {
+			fs.mkdirSync(sourceAsyncDir, { recursive: true });
+			fs.mkdirSync(RESULTS_DIR, { recursive: true });
+			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify({
+				runId: sourceRunId,
+				mode: "single",
+				state: "complete",
+				startedAt: 100,
+				lastUpdate: 200,
+				cwd: tempDir,
+				steps: [{ agent: "worker", status: "complete" }],
+			}, null, 2), "utf-8");
+			fs.writeFileSync(sourceResultPath, JSON.stringify({
+				id: sourceRunId,
+				agent: "worker",
+				mode: "single",
+				success: true,
+				state: "complete",
+				summary: "completed root output",
+				results: [{ agent: "worker", output: "completed root output", success: true }],
+			}, null, 2), "utf-8");
+			const { executor } = makeExecutor({ agents: [makeAgent("worker"), makeAgent("reviewer")] });
+
+			const reviveOnly = await executor.execute(
+				"resume-chain-complete-root-revive-only",
+				{ action: "resume", id: sourceRunId, message: "Follow up" },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			assert.equal(reviveOnly.isError, true);
+			assert.match(reviveOnly.content[0]?.text ?? "", /does not have a persisted session file/);
+
+			const attached = await executor.execute(
+				"resume-chain-complete-root",
+				{
+					action: "resume",
+					id: sourceRunId,
+					chain: [{ agent: "reviewer", task: "Review this completed root result: {previous}" }],
+				},
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(attached.isError, undefined);
+			assert.match(attached.content[0]?.text ?? "", /Attached async subagent/);
+			assert.ok(attached.details?.asyncId, "expected attached chain async id");
+			await waitForFile(path.join(RESULTS_DIR, `${attached.details.asyncId}.json`));
+		} finally {
+			fs.rmSync(sourceAsyncDir, { recursive: true, force: true });
+			fs.rmSync(sourceResultPath, { force: true });
 		}
 	});
 
