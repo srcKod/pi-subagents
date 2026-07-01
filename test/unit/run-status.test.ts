@@ -77,6 +77,7 @@ describe("async run status inspection", () => {
 				runId: "run-parallel",
 				mode: "parallel",
 				state: "running",
+				error: "top-level async status error",
 				pid: 12345,
 				startedAt: 100,
 				lastUpdate: 100,
@@ -100,6 +101,7 @@ describe("async run status inspection", () => {
 
 			const text = textContent(result);
 			assert.match(text, /Mode: parallel/);
+			assert.match(text, /Error: top-level async status error/);
 			assert.match(text, /Progress: 2 agents running · 0\/3 done/);
 			assert.match(text, new RegExp(`Output: ${runOutputPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 			assert.match(text, /Agent 1\/3: reviewer running \(gpt-5\.5 · thinking high\)/);

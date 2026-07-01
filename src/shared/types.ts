@@ -149,7 +149,7 @@ export type SubagentLifecycleArtifactVersion = typeof SUBAGENT_LIFECYCLE_ARTIFAC
 
 export type PublicNestedStepSummary = Pick<
 	NestedStepSummary,
-	"agent" | "status" | "sessionFile" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "startedAt" | "endedAt" | "error"
+	"agent" | "status" | "sessionFile" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "startedAt" | "endedAt" | "error" | "timedOut"
 > & {
 	children?: PublicNestedRunSummary[];
 };
@@ -162,7 +162,7 @@ export type CostSummary = {
 
 export type PublicNestedRunSummary = Pick<
 	NestedRunSummary,
-	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error"
+	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut"
 > & {
 	steps?: PublicNestedStepSummary[];
 	children?: PublicNestedRunSummary[];
@@ -435,6 +435,9 @@ export interface Details {
 	controlEvents?: ControlEvent[];
 	asyncId?: string;
 	asyncDir?: string;
+	timeoutMs?: number;
+	deadlineAt?: number;
+	timedOut?: boolean;
 	progress?: AgentProgress[];
 	progressSummary?: ProgressSummary;
 	artifacts?: {
@@ -515,6 +518,7 @@ export interface NestedStepSummary {
 	startedAt?: number;
 	endedAt?: number;
 	error?: string;
+	timedOut?: boolean;
 	children?: NestedRunSummary[];
 }
 
@@ -550,6 +554,9 @@ export interface NestedRunSummary extends NestedRunAddress {
 	startedAt?: number;
 	endedAt?: number;
 	lastUpdate?: number;
+	timeoutMs?: number;
+	deadlineAt?: number;
+	timedOut?: boolean;
 	error?: string;
 }
 
@@ -573,6 +580,8 @@ export interface AsyncStartedEvent {
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	workflowGraph?: WorkflowGraphSnapshot;
+	timeoutMs?: number;
+	deadlineAt?: number;
 	nestedRoute?: NestedRouteInfo;
 }
 
@@ -582,6 +591,7 @@ export interface AsyncStatus {
 	sessionId?: string;
 	mode: SubagentRunMode;
 	state: "queued" | "running" | "complete" | "failed" | "paused";
+	error?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -592,6 +602,9 @@ export interface AsyncStatus {
 	startedAt: number;
 	endedAt?: number;
 	lastUpdate?: number;
+	timeoutMs?: number;
+	deadlineAt?: number;
+	timedOut?: boolean;
 	pid?: number;
 	cwd?: string;
 	currentStep?: number;
@@ -622,6 +635,7 @@ export interface AsyncStatus {
 		endedAt?: number;
 		durationMs?: number;
 		exitCode?: number | null;
+		timedOut?: boolean;
 		tokens?: TokenUsage;
 		skills?: string[];
 		model?: string;
@@ -673,6 +687,9 @@ export interface AsyncJobState {
 	activeParallelGroup?: boolean;
 	startedAt?: number;
 	updatedAt?: number;
+	timeoutMs?: number;
+	deadlineAt?: number;
+	timedOut?: boolean;
 	sessionDir?: string;
 	outputFile?: string;
 	totalTokens?: TokenUsage;

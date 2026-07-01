@@ -202,6 +202,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			const lines = [
 				`Run: ${status.runId}`,
 				`State: ${status.state}`,
+				status.error ? `Error: ${status.error}` : undefined,
 				statusActivityText ? `Activity: ${statusActivityText}` : undefined,
 				`Mode: ${status.mode}`,
 				`Progress: ${progressLabel}`,

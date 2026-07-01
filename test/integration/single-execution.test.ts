@@ -115,6 +115,7 @@ interface ExecutorToolResult {
 	isError?: boolean;
 	details?: {
 		totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
+		timeoutMs?: number;
 	};
 }
 
@@ -1147,20 +1148,20 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 0);
 	});
 
-	it("rejects foreground timeout settings for async runs before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("allows timeout settings for async runs before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const executor = makeExecutor();
 
 		const result = await executor.execute(
 			"timeout-async-validation",
-			{ agent: "echo", task: "Task", async: true, timeoutMs: 100 },
+			{ agent: "echo", task: "Task", async: true, timeoutMs: 1_000 },
 			new AbortController().signal,
 			undefined,
 			makeMinimalCtx(tempDir),
 		);
 
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /foreground runs/);
-		assert.equal(mockPi.callCount(), 0);
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /Async:/);
+		assert.equal(result.details?.timeoutMs, 1_000);
 	});
 
 	it("rejects file-only mode without an output path before spawning", async () => {

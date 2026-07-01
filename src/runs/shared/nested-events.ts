@@ -223,6 +223,7 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 		...(clampNumber(raw.startedAt) !== undefined ? { startedAt: clampNumber(raw.startedAt) } : {}),
 		...(clampNumber(raw.endedAt) !== undefined ? { endedAt: clampNumber(raw.endedAt) } : {}),
 		...(stringValue(raw.error, 1024) ? { error: stringValue(raw.error, 1024) } : {}),
+		...(raw.timedOut === true ? { timedOut: true } : {}),
 		...(depth < MAX_DEPTH && Array.isArray(raw.children) ? { children: raw.children.map((child) => sanitizeSummary(child, depth + 1)).filter((child): child is NestedRunSummary => Boolean(child)).slice(0, MAX_CHILDREN) } : {}),
 	};
 }
@@ -272,6 +273,9 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(clampNumber(raw.startedAt) !== undefined ? { startedAt: clampNumber(raw.startedAt) } : {}),
 		...(clampNumber(raw.endedAt) !== undefined ? { endedAt: clampNumber(raw.endedAt) } : {}),
 		...(clampNumber(raw.lastUpdate) !== undefined ? { lastUpdate: clampNumber(raw.lastUpdate) } : {}),
+		...(clampNumber(raw.timeoutMs) !== undefined ? { timeoutMs: clampNumber(raw.timeoutMs) } : {}),
+		...(clampNumber(raw.deadlineAt) !== undefined ? { deadlineAt: clampNumber(raw.deadlineAt) } : {}),
+		...(raw.timedOut === true ? { timedOut: true } : {}),
 		...(stringValue(raw.error, 1024) ? { error: stringValue(raw.error, 1024) } : {}),
 		...(steps && steps.length > 0 ? { steps } : {}),
 		...(depth < MAX_DEPTH && Array.isArray(raw.children) ? { children: raw.children.map((child) => sanitizeSummary(child, depth + 1)).filter((child): child is NestedRunSummary => Boolean(child)).slice(0, MAX_CHILDREN) } : {}),
@@ -405,6 +409,42 @@ export function findNestedRouteForRootId(rootRunId: string): NestedRoute | undef
 		}
 	}
 	return undefined;
+}
+
+/**
+ * Scan the nested-events directory once and index every route by its root run
+ * id. Use this when resolving routes for many runs (e.g. listAsyncRuns) so the
+ * cost is O(routes) total instead of O(runs * routes) from calling
+ * findNestedRouteForRootId per run.
+ */
+export function buildNestedRouteIndex(): Map<string, NestedRoute> {
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(NESTED_EVENTS_DIR);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+		throw error;
+	}
+	const index = new Map<string, NestedRoute>();
+	for (const entry of entries) {
+		const routeRoot = path.join(NESTED_EVENTS_DIR, entry);
+		try {
+			const metadata = JSON.parse(fs.readFileSync(path.join(routeRoot, ROUTE_FILE), "utf-8")) as { rootRunId?: unknown; capabilityToken?: unknown };
+			if (typeof metadata.rootRunId !== "string" || typeof metadata.capabilityToken !== "string") continue;
+			if (index.has(metadata.rootRunId)) continue;
+			const route: NestedRoute = {
+				rootRunId: metadata.rootRunId,
+				eventSink: path.join(routeRoot, "events"),
+				controlInbox: path.join(routeRoot, "controls"),
+				capabilityToken: metadata.capabilityToken,
+			};
+			validateRouteShape(route);
+			index.set(metadata.rootRunId, route);
+		} catch {
+			continue;
+		}
+	}
+	return index;
 }
 
 export function projectNestedRegistryForRoot(rootRunId: string): NestedRegistry | undefined {
@@ -791,6 +831,10 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		...(status.turnCount !== undefined ? { turnCount: status.turnCount } : {}),
 		...(status.toolCount !== undefined ? { toolCount: status.toolCount } : {}),
 		...(status.totalTokens ? { totalTokens: status.totalTokens } : {}),
+		...(status.timeoutMs !== undefined ? { timeoutMs: status.timeoutMs } : {}),
+		...(status.deadlineAt !== undefined ? { deadlineAt: status.deadlineAt } : {}),
+		...(status.timedOut !== undefined ? { timedOut: status.timedOut } : {}),
+		...(status.error ? { error: status.error } : {}),
 		...(status.startedAt !== undefined ? { startedAt: status.startedAt } : { startedAt: fallback.ts }),
 		...(status.endedAt !== undefined ? { endedAt: status.endedAt } : {}),
 		lastUpdate: status.lastUpdate ?? fallback.ts,
@@ -809,6 +853,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 			...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
 			...(step.endedAt !== undefined ? { endedAt: step.endedAt } : {}),
 			...(step.error ? { error: step.error } : {}),
+			...(step.timedOut !== undefined ? { timedOut: step.timedOut } : {}),
 		})).slice(0, MAX_STEPS) } : {}),
 	};
 }

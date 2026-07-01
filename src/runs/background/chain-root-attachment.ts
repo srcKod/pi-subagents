@@ -26,17 +26,21 @@ export interface ImportedAsyncRootResult {
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
+	timedOut?: boolean;
 }
 
 interface AsyncResultFile {
 	state?: string;
 	success?: boolean;
 	summary?: string;
+	error?: string;
+	timedOut?: boolean;
 	results?: Array<{
 		agent?: string;
 		output?: string;
 		error?: string;
 		success?: boolean;
+		timedOut?: boolean;
 		sessionFile?: string;
 		intercomTarget?: string;
 		model?: string;
@@ -87,6 +91,7 @@ function resultState(result: AsyncResultFile | undefined, child: NonNullable<Asy
 
 function outputFromTerminalStatus(root: ImportedAsyncRoot, status: AsyncStatus, step: NonNullable<AsyncStatus["steps"]>[number] | undefined): ImportedAsyncRootResult {
 	const agent = step?.agent ?? status.steps?.[root.index]?.agent ?? "subagent";
+	const timedOut = step?.timedOut === true || status.timedOut === true;
 	const message = step?.error ?? status.error ?? `Attached async root ${root.runId} ended without a result file at ${root.resultPath}.`;
 	return {
 		agent,
@@ -94,6 +99,7 @@ function outputFromTerminalStatus(root: ImportedAsyncRoot, status: AsyncStatus, 
 		success: false,
 		exitCode: 1,
 		error: message,
+		...(timedOut ? { timedOut: true } : {}),
 		...(step?.sessionFile ?? status.sessionFile ? { sessionFile: step?.sessionFile ?? status.sessionFile } : {}),
 		...(step?.model ? { model: step.model } : {}),
 		...(step?.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
@@ -106,20 +112,39 @@ function outputFromTerminalStatus(root: ImportedAsyncRoot, status: AsyncStatus, 
 	};
 }
 
+function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, message: string): ImportedAsyncRootResult {
+	const step = selectedStatusStep(status, root.index);
+	return {
+		agent: step?.agent ?? status?.steps?.[root.index]?.agent ?? "subagent",
+		output: message,
+		success: false,
+		exitCode: 1,
+		error: message,
+		timedOut: true,
+		...(step?.sessionFile ?? status?.sessionFile ? { sessionFile: step?.sessionFile ?? status?.sessionFile } : {}),
+		...(step?.model ? { model: step.model } : {}),
+		...(step?.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
+		...(step?.modelAttempts ? { modelAttempts: step.modelAttempts } : {}),
+		...(step?.totalCost ? { totalCost: step.totalCost } : {}),
+	};
+}
+
 function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null, result: AsyncResultFile): ImportedAsyncRootResult {
 	const child = result.results?.[root.index];
 	const step = selectedStatusStep(status, root.index);
 	const state = resultState(result, child);
 	const agent = child?.agent ?? step?.agent ?? status?.steps?.[root.index]?.agent ?? "subagent";
 	const output = child?.output ?? result.summary ?? "";
-	const success = state === "complete";
-	const error = child?.error ?? (success ? undefined : result.summary ?? status?.error ?? `Attached async root ${root.runId} did not complete successfully.`);
+	const timedOut = child?.timedOut === true || step?.timedOut === true || result.timedOut === true || status?.timedOut === true;
+	const success = state === "complete" && !timedOut;
+	const error = child?.error ?? (success ? undefined : result.error ?? result.summary ?? status?.error ?? `Attached async root ${root.runId} did not complete successfully.`);
 	return {
 		agent,
 		output: success ? output : (output || error || ""),
 		success,
 		exitCode: success ? 0 : 1,
 		...(error ? { error } : {}),
+		...(timedOut ? { timedOut: true } : {}),
 		...(child?.sessionFile ?? step?.sessionFile ?? status?.sessionFile ? { sessionFile: child?.sessionFile ?? step?.sessionFile ?? status?.sessionFile } : {}),
 		...(child?.intercomTarget ? { intercomTarget: child.intercomTarget } : {}),
 		...(child?.model ?? step?.model ? { model: child?.model ?? step?.model } : {}),
@@ -135,7 +160,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 
 export async function waitForImportedAsyncRoot(
 	root: ImportedAsyncRoot,
-	options: { pollIntervalMs?: number; terminalResultGraceMs?: number; now?: () => number } = {},
+	options: { pollIntervalMs?: number; terminalResultGraceMs?: number; now?: () => number; shouldAbort?: () => boolean; timeoutMessage?: string } = {},
 ): Promise<ImportedAsyncRootResult> {
 	const pollIntervalMs = options.pollIntervalMs ?? 500;
 	const terminalResultGraceMs = options.terminalResultGraceMs ?? 1_000;
@@ -143,6 +168,7 @@ export async function waitForImportedAsyncRoot(
 	let terminalSince: number | undefined;
 	for (;;) {
 		const status = readStatus(root.asyncDir);
+		if (options.shouldAbort?.()) return outputFromTimeout(root, status, options.timeoutMessage ?? "Subagent timed out.");
 		const result = readResultFile(root.resultPath);
 		if (result) return buildImportedResult(root, status, result);
 		if (isTerminalStatus(status, root.index)) {

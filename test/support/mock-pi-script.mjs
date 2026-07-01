@@ -253,6 +253,9 @@ async function main() {
 	const args = process.argv.slice(2);
 	const jsonMode = isJsonMode(args);
 	const response = claimNextResponse(queueDir, args) ?? defaultResponse();
+	if (response.ignoreSigterm === true) {
+		process.on("SIGTERM", () => {});
+	}
 	writeSessionFile(args);
 	fs.writeFileSync(
 		path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`),

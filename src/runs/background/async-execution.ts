@@ -130,6 +130,7 @@ interface AsyncChainParams {
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 	nestedRoute?: NestedRouteInfo;
 	acceptance?: AcceptanceInput;
+	timeoutMs?: number;
 	/** Global cap on simultaneously-running subagent tasks within the async run. */
 	globalConcurrencyLimit?: number;
 }
@@ -162,6 +163,7 @@ interface AsyncSingleParams {
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 	nestedRoute?: NestedRouteInfo;
 	acceptance?: AcceptanceInput;
+	timeoutMs?: number;
 }
 
 interface AsyncExecutionResult {
@@ -646,6 +648,7 @@ export function executeAsyncChain(
 		return formatAsyncStartError(resultMode, built.error);
 	}
 	const { steps, runnerCwd, workflowGraph, eventChain } = built;
+	const deadlineAt = params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined;
 	let childTargetIndex = 0;
 	const childIntercomTargets = childIntercomTarget ? steps.flatMap((step) => {
 		if (!("parallel" in step) && step.importAsyncRoot) {
@@ -688,6 +691,8 @@ export function executeAsyncChain(
 				childIntercomTargets,
 				resultMode,
 				dynamicFanoutMaxItems: params.dynamicFanoutMaxItems,
+				timeoutMs: params.timeoutMs,
+				deadlineAt,
 				globalConcurrencyLimit: params.globalConcurrencyLimit,
 				workflowGraph,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
@@ -761,6 +766,7 @@ export function executeAsyncChain(
 						agents: flatAgents,
 						chainStepCount: eventChain.length,
 						parallelGroups,
+						...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
 						startedAt: now,
 						lastUpdate: now,
 					},
@@ -790,6 +796,7 @@ export function executeAsyncChain(
 			workflowGraph,
 			cwd: runnerCwd,
 			asyncDir,
+			...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
 			nestedRoute,
 		});
 	}
@@ -802,7 +809,7 @@ export function executeAsyncChain(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`) }],
-		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph },
+		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}) },
 	};
 }
 
@@ -876,6 +883,7 @@ export function executeAsyncSingle(
 	);
 	const effectiveThinking = params.thinkingOverride ?? agentConfig.thinking;
 	const model = applyThinkingSuffix(primaryModel, effectiveThinking, params.thinkingOverride !== undefined);
+	const deadlineAt = params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined;
 	let spawnResult: { pid?: number; error?: string } = {};
 	try {
 		spawnResult = spawnRunner(
@@ -931,6 +939,8 @@ export function executeAsyncSingle(
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
 				controlConfig,
+				timeoutMs: params.timeoutMs,
+				deadlineAt,
 				controlIntercomTarget,
 				childIntercomTargets: childIntercomTarget ? [childIntercomTarget(agent, 0)] : undefined,
 				resultMode: "single",
@@ -980,6 +990,7 @@ export function executeAsyncSingle(
 						agent,
 						agents: [agent],
 						chainStepCount: 1,
+						...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
 						startedAt: now,
 						lastUpdate: now,
 					},
@@ -998,12 +1009,13 @@ export function executeAsyncSingle(
 			task: task?.slice(0, 50),
 			cwd: runnerCwd,
 			asyncDir,
+			...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
 			nestedRoute,
 		});
 	}
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`) }],
-		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir },
+		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}) },
 	};
 }

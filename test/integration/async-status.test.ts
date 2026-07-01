@@ -429,4 +429,35 @@ describe("async status helpers", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("filters terminal runs to active states without scanning nested routes per run", () => {
+		// Regression guard: load-time restoration calls listAsyncRuns with a
+		// queued/running filter over every run dir on disk. The nested-route
+		// lookup must be skipped for runs that fail the state filter, otherwise
+		// session start freezes when many stale run dirs have accumulated.
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-filter-"));
+		try {
+			for (let i = 0; i < 200; i++) {
+				createAsyncDir(root, `run-${i}`, {
+					runId: `run-${i}`,
+					mode: "single",
+					state: "complete",
+					startedAt: 100,
+					lastUpdate: 200,
+					steps: [{ agent: "reviewer", status: "complete" }],
+				});
+			}
+
+			const start = Date.now();
+			const runs = listAsyncRuns(root, { states: ["queued", "running"] });
+			const elapsed = Date.now() - start;
+
+			assert.equal(runs.length, 0);
+			// 200 terminal dirs filtered to active states should resolve in well
+			// under a second. The old per-run nested-route scan blew past this.
+			assert.ok(elapsed < 1000, `listAsyncRuns took ${elapsed}ms for 200 terminal runs`);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 });

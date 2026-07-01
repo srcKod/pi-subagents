@@ -37,6 +37,13 @@ export interface InterruptRequest {
 	reason?: string;
 }
 
+export interface TimeoutRequest {
+	type: "timeout";
+	ts?: number;
+	source?: string;
+	reason?: string;
+}
+
 /** Control inbox directory inside an async run dir. */
 export function controlInboxDir(asyncDir: string): string {
 	return path.join(asyncDir, "control");
@@ -45,6 +52,11 @@ export function controlInboxDir(asyncDir: string): string {
 /** Path of the portable interrupt request file. */
 export function interruptRequestPath(asyncDir: string): string {
 	return path.join(controlInboxDir(asyncDir), "interrupt.json");
+}
+
+/** Path of the portable timeout request file. */
+export function timeoutRequestPath(asyncDir: string): string {
+	return path.join(controlInboxDir(asyncDir), "timeout.json");
 }
 
 /**
@@ -62,6 +74,17 @@ export function requestAsyncInterrupt(
 	return requestPath;
 }
 
+export function requestAsyncTimeout(
+	asyncDir: string,
+	payload: Omit<TimeoutRequest, "type"> = {},
+	deps: { now?: () => number } = {},
+): string {
+	const requestPath = timeoutRequestPath(asyncDir);
+	const request: TimeoutRequest = { ...payload, ts: payload.ts ?? deps.now?.() ?? Date.now(), type: "timeout" };
+	writeAtomicJson(requestPath, request);
+	return requestPath;
+}
+
 /**
  * Runner side: consume a pending interrupt request. Idempotent — removes the file
  * so each distinct request fires exactly once. Returns whether one was pending.
@@ -71,6 +94,20 @@ export function consumeInterruptRequest(
 	fsImpl: Pick<typeof fs, "existsSync" | "rmSync"> = fs,
 ): boolean {
 	const requestPath = interruptRequestPath(asyncDir);
+	if (!fsImpl.existsSync(requestPath)) return false;
+	try {
+		fsImpl.rmSync(requestPath, { force: true, recursive: true });
+	} catch {
+		// Already removed by a concurrent check — still counts as consumed.
+	}
+	return true;
+}
+
+export function consumeTimeoutRequest(
+	asyncDir: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "rmSync"> = fs,
+): boolean {
+	const requestPath = timeoutRequestPath(asyncDir);
 	if (!fsImpl.existsSync(requestPath)) return false;
 	try {
 		fsImpl.rmSync(requestPath, { force: true, recursive: true });
@@ -114,6 +151,17 @@ export function deliverInterruptRequest(input: {
 	}
 }
 
+export function deliverTimeoutRequest(input: {
+	asyncDir: string;
+	pid?: number;
+	kill?: KillFn;
+	signal?: NodeJS.Signals;
+	now?: () => number;
+	source?: string;
+}): void {
+	requestAsyncTimeout(input.asyncDir, input.source ? { source: input.source } : {}, { now: input.now });
+}
+
 /**
  * Runner side: watch the control inbox and route interrupt requests into
  * `onInterrupt`. Uses `fs.watch` when available plus an interval poll as a
@@ -124,6 +172,7 @@ export function watchAsyncControlInbox(
 	asyncDir: string,
 	opts: {
 		onInterrupt: () => void;
+		onTimeout?: () => void;
 		pollIntervalMs?: number;
 		fs?: ControlChannelFs;
 		timers?: ControlChannelTimers;
@@ -142,6 +191,7 @@ export function watchAsyncControlInbox(
 	const check = (): void => {
 		if (disposed) return;
 		try {
+			if (consumeTimeoutRequest(asyncDir, fsImpl)) opts.onTimeout?.();
 			if (consumeInterruptRequest(asyncDir, fsImpl)) opts.onInterrupt();
 		} catch {
 			// Never let inbox errors crash the runner.

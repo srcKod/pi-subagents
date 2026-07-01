@@ -1672,6 +1672,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			controlIntercomTarget,
 			childIntercomTarget,
 			nestedRoute,
+			timeoutMs: data.timeoutMs,
 			globalConcurrencyLimit: deps.config.globalConcurrencyLimit,
 		});
 	}
@@ -1704,6 +1705,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			controlIntercomTarget,
 			childIntercomTarget,
 			nestedRoute,
+			timeoutMs: data.timeoutMs,
 			globalConcurrencyLimit: deps.config.globalConcurrencyLimit,
 		});
 	}
@@ -1752,6 +1754,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			childIntercomTarget: childIntercomTarget ? (agent, index) => childIntercomTarget(agent, index) : undefined,
 			nestedRoute,
 			acceptance: params.acceptance,
+			timeoutMs: data.timeoutMs,
 		});
 	}
 
@@ -1823,9 +1826,6 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 	});
 
 	if (chainResult.requestedAsync) {
-		if (data.timeoutMs !== undefined) {
-			return buildRequestedModeError(params, "timeoutMs/maxRuntimeMs are only supported for foreground runs; background launch from clarify cannot preserve the timeout.");
-		}
 		if (!isAsyncAvailable()) {
 			return {
 				content: [{ type: "text", text: "Background mode requires upstream jiti for TypeScript execution but it could not be found. Ensure the pi-subagents package dependencies are installed." }],
@@ -1867,6 +1867,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			controlIntercomTarget: data.intercomBridge.active ? data.intercomBridge.orchestratorTarget : undefined,
 			childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
 			nestedRoute: data.nestedRoute,
+			timeoutMs: data.timeoutMs,
 			globalConcurrencyLimit: deps.config.globalConcurrencyLimit,
 		});
 	}
@@ -2281,9 +2282,6 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		}
 
 		if (result.runInBackground) {
-			if (data.timeoutMs !== undefined) {
-				return buildRequestedModeError(params, "timeoutMs/maxRuntimeMs are only supported for foreground runs; background launch from clarify cannot preserve the timeout.");
-			}
 			if (!isAsyncAvailable()) {
 				return {
 					content: [{ type: "text", text: "Background mode requires upstream jiti for TypeScript execution but it could not be found. Ensure the pi-subagents package dependencies are installed." }],
@@ -2338,6 +2336,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				controlConfig,
 				controlIntercomTarget: data.intercomBridge.active ? data.intercomBridge.orchestratorTarget : undefined,
 				childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
+				timeoutMs: data.timeoutMs,
 				globalConcurrencyLimit: deps.config.globalConcurrencyLimit,
 			});
 		}
@@ -2589,9 +2588,6 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		if (override?.skills !== undefined) skillOverride = override.skills;
 
 		if (result.runInBackground) {
-			if (data.timeoutMs !== undefined) {
-				return buildRequestedModeError(params, "timeoutMs/maxRuntimeMs are only supported for foreground runs; background launch from clarify cannot preserve the timeout.");
-			}
 			if (!isAsyncAvailable()) {
 				return {
 					content: [{ type: "text", text: "Background mode requires upstream jiti for TypeScript execution but it could not be found. Ensure the pi-subagents package dependencies are installed." }],
@@ -2634,6 +2630,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				controlConfig,
 				controlIntercomTarget: data.intercomBridge.active ? data.intercomBridge.orchestratorTarget : undefined,
 				childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
+				timeoutMs: data.timeoutMs,
 			});
 		}
 	}
@@ -3076,9 +3073,6 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const requestedAsync = effectiveParams.async ?? deps.asyncByDefault;
 		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;
 		const effectiveAsync = requestedAsync && effectiveParams.clarify !== true;
-		if (foregroundTimeout.timeoutMs !== undefined && effectiveAsync) {
-			return buildRequestedModeError(effectiveParams, "timeoutMs/maxRuntimeMs are only supported for foreground runs; set async: false or omit the timeout for background runs.");
-		}
 		const controlConfig = resolveControlConfig(deps.config.control, effectiveParams.control);
 
 		const artifactConfig: ArtifactConfig = {

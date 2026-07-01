@@ -129,4 +129,31 @@ describe("async chain root attachment", () => {
 		assert.equal(result.exitCode, 1);
 		assert.match(result.error ?? "", /ended without a result file/);
 	});
+
+	it("stops waiting when the parent timeout aborts an attached root", async () => {
+		const importedRoot = root();
+		writeJson(path.join(importedRoot.asyncDir, "status.json"), {
+			runId: importedRoot.runId,
+			mode: "single",
+			state: "running",
+			startedAt: 1,
+			steps: [{ agent: "worker", status: "running" }],
+		});
+		let timedOut = false;
+		const waiting = waitForImportedAsyncRoot(importedRoot, {
+			pollIntervalMs: 1,
+			shouldAbort: () => timedOut,
+			timeoutMessage: "parent timed out",
+		});
+		setTimeout(() => {
+			timedOut = true;
+		}, 10);
+
+		const result = await waiting;
+
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.timedOut, true);
+		assert.equal(result.error, "parent timed out");
+		assert.equal(result.output, "parent timed out");
+	});
 });

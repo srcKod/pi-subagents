@@ -31,9 +31,13 @@ interface AsyncResultPayload {
 	sessionId?: string;
 	mode?: string;
 	summary?: string;
+	error?: string;
+	timeoutMs?: number;
+	deadlineAt?: number;
+	timedOut?: boolean;
 	totalTokens?: { input: number; output: number; total: number };
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
-	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown } }>;
+	results: Array<{ output?: string; success?: boolean; error?: string; timedOut?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown } }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; error?: string }> }> };
 }
@@ -45,6 +49,10 @@ interface AsyncStatusPayload {
 	currentTool?: string;
 	currentPath?: string;
 	state?: string;
+	error?: string;
+	timeoutMs?: number;
+	deadlineAt?: number;
+	timedOut?: boolean;
 	totalTokens?: { total: number };
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
 	parallelGroups?: Array<{ start: number; count: number; stepIndex: number }>;
@@ -58,6 +66,7 @@ interface AsyncStatusPayload {
 		currentTool?: string;
 		status?: string;
 		exitCode?: number;
+		timedOut?: boolean;
 		error?: string;
 		model?: string;
 		thinking?: string;
@@ -376,6 +385,129 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.success, false);
 		assert.deepEqual(status.steps?.map((step) => step.status), ["paused", "paused", "paused"]);
 		assert.equal(mockPi.callCount(), 3);
+	});
+
+	it("marks async parallel runs that exceed timeoutMs as timed out", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ delay: 5_000, output: "one done" });
+		mockPi.onCall({ delay: 5_000, output: "two done" });
+		const id = `async-timeout-parallel-${Date.now().toString(36)}`;
+		executeAsyncChain(id, {
+			chain: [{
+				parallel: [
+					{ agent: "one", task: "Wait" },
+					{ agent: "two", task: "Wait" },
+				],
+				concurrency: 2,
+			}],
+			resultMode: "parallel",
+			agents: [makeAgent("one"), makeAgent("two")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			timeoutMs: 1_500,
+		});
+
+		await waitForMockPiCall(mockPi, 1, 10_000);
+		const resultPath = await waitForAsyncResultFile(id, 8_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(payload.state, "failed");
+		assert.equal(payload.success, false);
+		assert.equal(payload.exitCode, 1);
+		assert.equal(payload.timeoutMs, 1_500);
+		assert.equal(payload.timedOut, true);
+		assert.match(payload.summary ?? "", /Subagent timed out after 1500ms\./);
+		assert.equal(status.state, "failed");
+		assert.equal(status.timeoutMs, 1_500);
+		assert.equal(status.timedOut, true);
+		assert.match(status.error ?? "", /Subagent timed out after 1500ms\./);
+		assert.deepEqual(status.steps?.map((step) => step.status), ["failed", "failed"]);
+		assert.deepEqual(status.steps?.map((step) => step.timedOut), [true, true]);
+		assert.deepEqual(status.steps?.map((step) => step.error), ["Subagent timed out after 1500ms.", "Subagent timed out after 1500ms."]);
+		assert.deepEqual(payload.results.map((result) => result.timedOut), [true, true]);
+		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("hard-kills async children that ignore timeout SIGTERM", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ delay: 60_000, ignoreSigterm: true, output: "too late" });
+		const id = `async-timeout-hard-kill-${Date.now().toString(36)}`;
+		const startedAt = Date.now();
+		executeAsyncSingle(id, {
+			agent: "stubborn",
+			task: "Ignore soft termination",
+			agentConfig: makeAgent("stubborn", { model: "primary-model", fallbackModels: ["fallback-model"] }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			timeoutMs: 150,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id, 8_000);
+		const elapsedMs = Date.now() - startedAt;
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(payload.state, "failed");
+		assert.equal(payload.timedOut, true);
+		assert.equal(payload.results[0]?.timedOut, true);
+		assert.match(payload.results[0]?.error ?? "", /Subagent timed out after 150ms\./);
+		assert.equal(status.timedOut, true);
+		assert.equal(status.steps?.[0]?.timedOut, true);
+		assert.ok(elapsedMs < 7_000, `timeout result should settle after hard kill, elapsed ${elapsedMs}ms`);
+		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("cancels async acceptance verification when the run times out", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "implementation complete" });
+		const id = `async-timeout-acceptance-${Date.now().toString(36)}`;
+		const startedAt = Date.now();
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Implement with verified acceptance",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			timeoutMs: 1_000,
+			acceptance: {
+				level: "verified",
+				verify: [{ id: "slow", command: `${process.execPath} -e "setTimeout(()=>process.exit(0), 5000)"`, timeoutMs: 10_000 }],
+			},
+		});
+
+		const resultPath = await waitForAsyncResultFile(id, 5_000);
+		const elapsedMs = Date.now() - startedAt;
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(payload.state, "failed");
+		assert.equal(payload.timedOut, true);
+		assert.equal(payload.results[0]?.timedOut, true);
+		assert.equal(payload.results[0]?.acceptance, undefined);
+		assert.equal(status.steps?.[0]?.timedOut, true);
+		assert.ok(elapsedMs < 3_000, `timeout should cancel acceptance verification promptly, elapsed ${elapsedMs}ms`);
 	});
 
 	it("async launch messages tell the parent not to sleep-poll", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -850,6 +982,48 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(secondDynamicArgs[secondDynamicArgs.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:off");
 		assert.deepEqual(status.steps?.slice(1).map((step) => step.sessionFile), [sessionA, sessionB]);
 		assert.deepEqual(status.steps?.slice(1).map((step) => step.thinking), ["off", "off"]);
+	});
+
+	it("cancels dynamic fanout aggregate acceptance when the run times out", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }] } });
+		mockPi.onCall({ output: "review-a", structuredOutput: { ok: "a" } });
+		const id = `async-dynamic-acceptance-timeout-${Date.now().toString(36)}`;
+		const startedAt = Date.now();
+		executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" }, acceptance: { level: "checked" } },
+					collect: { as: "reviews" },
+					acceptance: {
+						level: "verified",
+						verify: [{ id: "slow", command: `${process.execPath} -e "setTimeout(()=>process.exit(0), 5000)"`, timeoutMs: 10_000 }],
+					},
+				},
+			],
+			agents: [makeAgent("producer"), makeAgent("reviewer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-acceptance-timeout" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			timeoutMs: 1_000,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id, 5_000);
+		const elapsedMs = Date.now() - startedAt;
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const dynamicNode = payload.workflowGraph?.nodes?.[1] as { status?: string; error?: string; acceptanceStatus?: string } | undefined;
+		assert.equal(payload.state, "failed");
+		assert.equal(payload.timedOut, true);
+		assert.equal(payload.results.at(-1)?.timedOut, true);
+		assert.equal(payload.results.at(-1)?.acceptance, undefined);
+		assert.equal(dynamicNode?.status, "failed");
+		assert.match(dynamicNode?.error ?? "", /Subagent timed out after 1000ms\./);
+		assert.notEqual(dynamicNode?.acceptanceStatus, "verified");
+		assert.equal(status.timedOut, true);
+		assert.ok(elapsedMs < 3_000, `timeout should cancel dynamic aggregate acceptance promptly, elapsed ${elapsedMs}ms`);
 	});
 
 	it("async dynamic fanout recomputes later child intercom targets by final flat index", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

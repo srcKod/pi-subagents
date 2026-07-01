@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import type { AsyncJobState, SubagentState } from "../../src/shared/types.ts";
 import {
+	buildNestedRouteIndex,
 	createNestedRoute,
 	hasLiveNestedDescendants,
 	parseNestedEventRecords,
@@ -69,6 +70,33 @@ function child(id: string, state: "queued" | "running" | "complete" | "failed" |
 		steps: [{ agent: "leaf", status: state === "running" ? "running" as const : "complete" as const }],
 	};
 }
+
+describe("nested route index", () => {
+	it("indexes routes by root run id in a single directory scan", () => {
+		const routeA = trackRoute("index-root-a");
+		const routeB = trackRoute("index-root-b");
+
+		const index = buildNestedRouteIndex();
+
+		assert.equal(index.get("index-root-a")?.capabilityToken, routeA.capabilityToken);
+		assert.equal(index.get("index-root-b")?.capabilityToken, routeB.capabilityToken);
+		assert.equal(index.get("missing-root"), undefined);
+	});
+
+	it("keeps at most one route when a root run id has duplicate route dirs", () => {
+		const first = trackRoute("dup-root");
+		const second = trackRoute("dup-root");
+
+		const index = buildNestedRouteIndex();
+
+		// readdir order is not guaranteed, so the contract is deduplication: exactly
+		// one route is indexed per root run id, not a specific winner.
+		const indexed = index.get("dup-root");
+		assert.ok(indexed, "expected one route for dup-root");
+		const tokens = new Set([first.capabilityToken, second.capabilityToken]);
+		assert.ok(tokens.has(indexed.capabilityToken), "indexed route must be one of the two created routes");
+	});
+});
 
 describe("nested event route validation", () => {
 	it("resolves nested parent addresses with full inherited path", () => {

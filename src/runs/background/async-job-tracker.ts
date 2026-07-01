@@ -86,6 +86,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			activeParallelGroup: Boolean(activeGroup),
 			startedAt: run.startedAt,
 			updatedAt: run.lastUpdate ?? run.startedAt,
+			timeoutMs: run.timeoutMs,
+			deadlineAt: run.deadlineAt,
+			timedOut: run.timedOut,
 			sessionDir: run.sessionDir,
 			outputFile: run.outputFile,
 			totalTokens: run.totalTokens,
@@ -299,6 +302,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						job.sessionDir = status.sessionDir ?? job.sessionDir;
 						job.outputFile = status.outputFile ?? job.outputFile;
 						job.totalTokens = status.totalTokens ?? job.totalTokens;
+						job.timeoutMs = status.timeoutMs ?? job.timeoutMs;
+						job.deadlineAt = status.deadlineAt ?? job.deadlineAt;
+						job.timedOut = status.timedOut ?? job.timedOut;
 						job.sessionFile = status.sessionFile ?? job.sessionFile;
 						if ((job.status === "complete" || job.status === "failed" || job.status === "paused") && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 							scheduleCleanup(job.asyncId);
@@ -356,6 +362,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			activeParallelGroup: Boolean(firstGroupCount && firstGroupCount > 0),
 			startedAt: now,
 			updatedAt: now,
+			timeoutMs: info.timeoutMs,
+			deadlineAt: info.deadlineAt,
 			controlEventCursor: 0,
 		});
 		ensurePoller();
