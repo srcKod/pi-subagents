@@ -122,7 +122,7 @@ function packageConfig(config: ExtensionConfig, packageName: CompanionSuggestion
 		: DEFAULT_SURFACES;
 	return {
 		enabled: companionConfig?.enabled !== false && packageSpecific?.enabled !== false,
-		surfaces: new Set(surfaces.length > 0 ? surfaces : DEFAULT_SURFACES),
+		surfaces: new Set(surfaces),
 		dismissedConfig: packageSpecific?.dismissed,
 	};
 }
@@ -290,7 +290,9 @@ function packageDismissedWorkspaces(value: unknown): string[] {
 export function updateCompanionDismissal(packageName: CompanionSuggestionPackage, scope: "workspace" | "user" | "show", cwd: string): ExtensionConfig {
 	const workspaceKey = companionWorkspaceKey(cwd);
 	return updateConfig((current) => {
-		const companionSuggestions = current.companionSuggestions && current.companionSuggestions !== false ? current.companionSuggestions : {};
+		const companionSuggestions = current.companionSuggestions === false
+			? { enabled: false }
+			: current.companionSuggestions ?? {};
 		const packages = companionSuggestions.packages ?? {};
 		const packageConfig = packages[packageName] ?? {};
 		const dismissed = { ...(packageConfig.dismissed ?? {}) };

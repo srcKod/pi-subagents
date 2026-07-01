@@ -154,7 +154,7 @@ function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details 
 		currentStepIndex: input.currentStepIndex,
 		outputs: input.outputs,
 		totalCost: sumResultsCost(input.results),
-	workflowGraph: buildWorkflowGraphSnapshot({
+		workflowGraph: buildWorkflowGraphSnapshot({
 			runId: input.runId,
 			mode: "chain",
 			steps: input.chainSteps,

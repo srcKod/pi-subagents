@@ -151,6 +151,26 @@ describe("companion suggestions", () => {
 		assert.match(lines, /pi-prompt-template-model is not active/);
 	});
 
+	it("honors empty package-specific surfaces as no recommendation surfaces", () => {
+		const statuses = collectCompanionStatuses({
+			pi: makeRuntime(),
+			config: {
+				companionSuggestions: {
+					packages: {
+						"pi-intercom": { surfaces: [] },
+						"pi-prompt-template-model": { enabled: false },
+					},
+				},
+			},
+			cwd: tempDir,
+			orchestratorTarget: "subagent-chat-session",
+			workspaceKey: tempDir,
+		});
+
+		assert.equal(buildCompanionListLines(statuses).join("\n"), "");
+		assert.equal(buildCompanionStartupMessage(statuses), null);
+	});
+
 	it("sends one LLM-visible startup message without triggering a turn", () => {
 		const statuses = collectCompanionStatuses({
 			pi: makeRuntime(),
@@ -203,6 +223,26 @@ describe("companion suggestions", () => {
 
 		assert.equal(result.error, undefined);
 		assert.match(result.text, /Hid pi-intercom recommendations for this workspace/);
+		assert.deepEqual(saved.companionSuggestions?.packages?.["pi-intercom"]?.dismissed?.workspaces, [tempDir]);
+	});
+
+	it("preserves global companionSuggestions disablement when writing dismissal", () => {
+		const ctx = { cwd: tempDir };
+		const configPath = path.join(process.env.PI_CODING_AGENT_DIR!, "extensions", "subagent", "config.json");
+		fs.mkdirSync(path.dirname(configPath), { recursive: true });
+		fs.writeFileSync(configPath, `${JSON.stringify({ companionSuggestions: false }, null, "\t")}\n`, "utf-8");
+		const statuses = collectCompanionStatuses({
+			pi: makeRuntime(),
+			config: { companionSuggestions: false },
+			cwd: tempDir,
+			orchestratorTarget: "subagent-chat-session",
+			workspaceKey: tempDir,
+		});
+		const result = handleCompanionCommand("hide pi-intercom workspace", ctx as never, statuses);
+		const saved = JSON.parse(fs.readFileSync(configPath, "utf-8")) as { companionSuggestions?: { enabled?: boolean; packages?: Record<string, { dismissed?: { workspaces?: string[] } }> } };
+
+		assert.equal(result.error, undefined);
+		assert.equal(saved.companionSuggestions?.enabled, false);
 		assert.deepEqual(saved.companionSuggestions?.packages?.["pi-intercom"]?.dismissed?.workspaces, [tempDir]);
 	});
 });

@@ -67,6 +67,8 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("rate limit exceeded for provider"), true);
 		assert.equal(isRetryableModelFailure("model unavailable"), true);
 		assert.equal(isRetryableModelFailure("authentication failed"), true);
+		assert.equal(isRetryableModelFailure("Subagent produced no output (possible model cold-start or empty response)."), true);
+		assert.equal(isRetryableModelFailure("model load failed"), true);
 	});
 
 	it("does not treat ordinary task/tool failures as retryable model failures", () => {

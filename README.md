@@ -1064,6 +1064,14 @@ Makes top-level calls use background execution when the request does not explici
 
 Forces depth-0 single, parallel, and chain runs into background mode and bypasses clarify UI by forcing `clarify: false`. Nested calls keep their own inherited settings.
 
+### `globalConcurrencyLimit`
+
+```json
+{ "globalConcurrencyLimit": 20 }
+```
+
+Caps simultaneously running subagent tasks within a single run across top-level parallel tasks, inline chain parallel groups, and dynamic fanout groups. The default is `20`; invalid values are clamped to `1`. Per-step `concurrency` and `parallel.concurrency` still apply, so effective concurrency is the lower of the local cap and the available global slots.
+
 ### `parallel`
 
 ```json

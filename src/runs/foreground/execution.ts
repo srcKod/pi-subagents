@@ -774,7 +774,10 @@ async function runSingleAttempt(
 	}
 	if (result.exitCode === 0 && !result.error) {
 		const finalText = getFinalOutput(result.messages);
-		if (!finalText?.trim()) {
+		const missingStructuredOutput = options.structuredOutput
+			? !existsSync(options.structuredOutput.outputPath)
+			: false;
+		if (!finalText?.trim() && (!options.structuredOutput || missingStructuredOutput)) {
 			result.exitCode = 1;
 			result.error = "Subagent produced no output (possible model cold-start or empty response).";
 		}

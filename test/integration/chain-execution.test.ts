@@ -102,6 +102,7 @@ interface ChainExecutionResult {
 		results: ChainResultItem[];
 		chainAgents?: string[];
 		totalSteps?: number;
+		totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
 		workflowGraph?: {
 			nodes: Array<{ kind?: string; agent?: string; flatIndex?: number; outputName?: string; status?: string; error?: string; acceptanceStatus?: string; children?: Array<{ itemKey?: string; label?: string; status?: string; acceptanceStatus?: string }> }>;
 		};
@@ -219,6 +220,7 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 		assert.equal(result.details.results.length, 2);
 		assert.equal(result.details.results[0].agent, "analyst");
 		assert.equal(result.details.results[1].agent, "reporter");
+		assert.deepEqual(result.details.totalCost, { inputTokens: 200, outputTokens: 100, costUsd: 0.002 });
 	});
 
 	it("preserves completed chain results and marks the timed-out current step", async () => {
@@ -845,6 +847,14 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 
 		assert.ok(!result.isError);
 		assert.deepEqual(result.details.results[0]?.structuredOutput, { ok: true, note: "captured" });
+
+		mockPi.reset();
+		mockPi.onCall({ structuredOutput: { ok: true, note: "tool-only" } });
+		const structuredOnly = await executeChain(
+			makeChainParams([{ agent: "worker", task: "Return structured", outputSchema: schema }], agents),
+		);
+		assert.ok(!structuredOnly.isError);
+		assert.deepEqual(structuredOnly.details.results[0]?.structuredOutput, { ok: true, note: "tool-only" });
 
 		mockPi.reset();
 		mockPi.onCall({ output: "prose only" });
