@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-07-03
+
 ### Added
 - Added optional `toolBudget` limits for child subagent tool calls. Runs, steps, and agents can set `{ soft?, hard, block? }`; the child runtime nudges at the soft limit and blocks configured tools after the hard limit so runaway browsing can still finish with final text.
 - Added a stable v1 in-process event-bus RPC for other Pi extensions, with `ping`, `status`, async-only `spawn`, `interrupt`, and async `stop` over versioned request/reply envelopes.
