@@ -1534,6 +1534,8 @@ export interface AsyncStatus {
 		processTerminal?: ProcessTerminalV1;
 		capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 		capabilityAudit?: SubagentCapabilityAudit;
+		/** Task-profile ids of dependents that are blocked because this step failed (task-management dependency graph). Surfaced for the orchestrator to decide; the runner never auto-skips them. */
+		blockedDependents?: string[];
 	}>;
 	sessionDir?: string;
 	outputFile?: string;
@@ -2205,6 +2207,8 @@ export function resolveTempScopeId(options?: {
 
 const MAX_PARALLEL = 8;
 export const MAX_CONCURRENCY = 4;
+/** Maximum parallel scouts before fanout is capped to avoid same-model saturation. */
+export const SCOUT_MAX_FANOUT = 3;
 const configuredTempRoot = process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
 export const TEMP_ROOT_DIR = configuredTempRoot
 	? path.resolve(configuredTempRoot)
@@ -2389,4 +2393,84 @@ export function truncateOutput(
 		originalLines: lines.length,
 		artifactPath,
 	};
+}
+
+// ============================================================================
+// Task-Management Types (task-profile / task-planner / work-candidate-selection)
+// ============================================================================
+
+export type TaskKind = "code-write" | "code-read" | "transform" | "summarize" | "search";
+
+export const TASK_KINDS: readonly TaskKind[] = ["code-write", "code-read", "transform", "summarize", "search"];
+
+/** Stakes gate the optional verifier. High-stakes tasks get an extra cheap-model check against acceptance criteria. */
+export type TaskStakes = "normal" | "high";
+
+/** A resolved tool budget shape (mirrors ToolBudgetConfig above). */
+export interface TaskToolBudget {
+	hard: number;
+	soft?: number;
+	block: "*" | string[];
+}
+
+/** Per-kind defaults the framework applies to a task unless the orchestrator raises them. */
+export interface KindDefaults {
+	contextFloor: number;
+	tokenBudget: number;
+	toolBudget: TaskToolBudget;
+	capabilities: string[];
+}
+
+/**
+ * TaskProfile — the contract between the orchestrator (skill/intelligence) and the
+ * framework (scaffolding/validation).
+ */
+export interface TaskProfile {
+	id: string;
+	kind: TaskKind;
+	task: string;
+	dependsOn: string[];
+	acceptanceCriteria: string[];
+	model?: string;
+	needsReasoning?: boolean;
+	stakes?: TaskStakes;
+	toolBudget?: TaskToolBudget;
+	tokenBudget?: number;
+	contextFloor?: number;
+	capabilities?: string[];
+	estimatedInputTokens?: number;
+	testBaseClass?: "pest" | "phpunit" | "jest" | "vitest" | "none";
+}
+
+/** Result of topological task planning (planBatches). */
+export interface PlanResult {
+	batches: TaskProfile[][];
+	ok: boolean;
+	cycle?: string[];
+}
+
+/** A model entry in the task-management selection pool. */
+export interface SelectableModel {
+	fullId: string;
+	provider: string;
+	id: string;
+	isFree: boolean;
+	contextWindow: number;
+	capabilities: string[];
+}
+
+/** Shape of a single task for model-selection input. */
+export interface SelectionTaskInput {
+	id: string;
+	requiredContext: number;
+	capabilities: string[];
+}
+
+/** Per-task model assignment for a parallel batch (returned by assignBatchWorkCandidates). */
+export interface WorkCandidateAssignment {
+	assignments: Map<string, string>;
+	reused: string[];
+	poolUndersized: boolean;
+	/** Model fullIds that exceeded MAX_PER_MODEL, with their assigned count (empty when the cap holds). */
+	overflows?: Array<{ fullId: string; count: number }>;
 }
