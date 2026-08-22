@@ -146,9 +146,12 @@ describe("model fallback helpers", () => {
 	});
 
 	it("trusts an inherited parent model outside the registry", () => {
+		// Task-management: with no explicit fallback list, the dynamic fallback pool
+		// appends the available registry models (free+cheapest first, ties by fullId)
+		// after the trusted inherited parent, so the retry loop can rotate the pool.
 		assert.deepEqual(
 			buildModelCandidates("gateway/parent-model", undefined, availableModels, undefined, { primaryModelFromParent: true }),
-			["gateway/parent-model"],
+			["gateway/parent-model", "anthropic/claude-sonnet-4", "openai/gpt-5-mini"],
 		);
 		assert.throws(
 			() => buildModelCandidates("gateway/parent-model", undefined, availableModels),

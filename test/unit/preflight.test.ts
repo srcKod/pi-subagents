@@ -217,7 +217,9 @@ Project prompt.
 
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.model, "gateway/parent-model");
-		assert.deepEqual(result.contract.modelCandidates, ["gateway/parent-model"]);
+		// Task-management: with no explicit fallback list, the dynamic fallback pool
+		// appends the available registry models after the trusted inherited parent.
+		assert.deepEqual(result.contract.modelCandidates, ["gateway/parent-model", "test/primary"]);
 	});
 
 	it("bypasses native model validation for external CLI runners", async () => {

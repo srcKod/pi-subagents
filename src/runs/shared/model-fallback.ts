@@ -2,6 +2,7 @@ import type { ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts
 import type { Usage } from "../../shared/types.ts";
 import { filterFallbackCandidates, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
+import { modelQualifies, toSelectableModel } from "./model-capabilities.ts";
 
 export type { AvailableModelInfo };
 
@@ -354,6 +355,13 @@ export interface BuildModelCandidatesOptions {
 	onWarn?: (violation: ModelScopeViolation) => void;
 	/** The primary model came from the running parent session, not configuration. */
 	primaryModelFromParent?: boolean;
+	/**
+	 * When set, the dynamic fallback pool is restricted to models that QUALIFY for
+	 * the task (advertise every required capability and have enough context). This is
+	 * the task-management feature's policy: delegate work to free/cheap models that
+	 * can actually do the job, so a fallback never silently downgrades quality.
+	 */
+	qualification?: { requiredCapabilities: string[]; minContext: number };
 }
 
 export function inheritsParentModel(
@@ -398,7 +406,49 @@ export function buildModelCandidates(
 		seen.add(normalized);
 		candidates.push(normalized);
 	}
+	// Dynamic fallback pool (task-management): when no explicit fallback list is
+	// configured, delegate to models from the active registry. The pool is
+	// restricted to models that QUALIFY for the task (capabilities + context). The parent
+	// model is NOT added here — it is appended as the LAST-RESORT candidate by the caller,
+	// because the parent is the orchestrator and task work should be delegated to pool models.
+	//
+	// MAIN behavior: when `fallbackModels` is explicitly set (config/DSL), preserve the
+	// static/declarative list and do NOT append the pool — the contract is explicit ->
+	// main behavior, implicit -> feature behavior, evaluated per aspect (selection vs fallback).
+	const hasExplicitFallbacks = Array.isArray(fallbackModels) && fallbackModels.length > 0;
+	if (!hasExplicitFallbacks && availableModels && availableModels.length > 0) {
+		let pool = [...availableModels].filter((entry) => entry.fullId && !seen.has(entry.fullId));
+		// Restrict the pool to task-qualified models so a fallback never downgrades quality.
+		if (options?.qualification) {
+			const q = options.qualification;
+			pool = pool.filter((entry) => {
+				const sel = toSelectableModel(entry);
+				return modelQualifies(sel, q.requiredCapabilities, q.minContext);
+			});
+		}
+		const ordered = pool.sort((a, b) => poolSortKey(a) - poolSortKey(b) || (a.fullId < b.fullId ? -1 : 1));
+		for (const entry of ordered) {
+			if (!entry.fullId || seen.has(entry.fullId)) continue;
+			seen.add(entry.fullId);
+			candidates.push(entry.fullId);
+		}
+	}
 	return filterFallbackCandidates(candidates);
+}
+
+/**
+ * Sort key for the dynamic fallback pool: free models first (by input cost),
+ * then paid models (by input cost). This encodes the feature's "free + cheapest
+ * first" policy for the fallback candidate list. Paid models get a large base
+ * offset so all free models sort before all paid ones.
+ */
+function poolSortKey(entry: AvailableModelInfo): number {
+	const isFree =
+		typeof entry.cost?.input === "number" && typeof entry.cost?.output === "number"
+			? entry.cost.input === 0 && entry.cost.output === 0
+			: /\bfree\b/i.test(entry.fullId) || /\bfree\b/i.test(entry.id);
+	const cost = typeof entry.cost?.input === "number" ? entry.cost.input : Number.POSITIVE_INFINITY;
+	return (isFree ? 0 : 1) * 1e12 + cost;
 }
 
 const RETRYABLE_MODEL_FAILURE_PATTERNS = [

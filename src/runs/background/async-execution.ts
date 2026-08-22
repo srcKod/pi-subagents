@@ -17,7 +17,7 @@ import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveChainPath, resolveExistingReadPaths, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
-import type { RunnerStep } from "../shared/parallel-utils.ts";
+import { type RunnerStep, type RunnerSubagentStep, isParallelGroup, isDynamicRunnerGroup } from "../shared/parallel-utils.ts";
 import type { ContextMode } from "../shared/context-mode.ts";
 import { resolvePiPackageRoot } from "../shared/pi-spawn.ts";
 import { resolveNodeExecutable } from "../../shared/node-executable.ts";
@@ -25,6 +25,13 @@ import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } f
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV, PROMPT_REDACTED, resolveChildCwd } from "../../shared/utils.ts";
 import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, resolveModelCandidate, resolveSubagentModelOverride, type AvailableModelInfo, type ParentModel } from "../shared/model-fallback.ts";
+import { filterFallbackCandidates, isExcluded, parseModelKey } from "../shared/model-exclusions.ts";
+import { selectWorkCandidate, assignBatchWorkCandidates, poolUndersizeMessage } from "../shared/work-candidate-selection.ts";
+import { toSelectableModel, modelQualifies } from "../shared/model-capabilities.ts";
+import { LEGACY_FALLBACK_MIN_CONTEXT } from "../shared/task-context-floor.ts";
+import { validateTaskProfile } from "../shared/task-validators.ts";
+import { planBatches } from "../shared/task-planner.ts";
+import { KIND_DEFAULTS, isUniformCRUD } from "../shared/task-profile.ts";
 import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -49,11 +56,15 @@ import {
 	type ResolvedTurnBudget,
 	type ResolvedToolBudget,
 	type RunFanoutBudgetDescriptor,
+	type SelectableModel,
+	type SelectionTaskInput,
+	type TaskProfile,
 	type ToolBudgetConfig,
 	type SubagentRunMode,
 	type SteeringRecoveryDescriptor,
 	type UsageBudgetConfig,
 	DIRS,
+	SCOUT_MAX_FANOUT,
 	SUBAGENT_ASYNC_STARTED_EVENT,
 	SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
 	TEMP_ROOT_DIR,
@@ -192,6 +203,7 @@ interface AsyncChainParams {
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
 	activeAsyncCapacity?: ActiveAsyncCapacityHandle;
+	profiles?: TaskProfile[];
 }
 
 interface AsyncSingleParams {
@@ -262,6 +274,7 @@ interface AsyncSingleParams {
 		requestId: string;
 		requestDigest: string;
 	};
+	profiles?: TaskProfile[];
 }
 
 interface AsyncExecutionResult {
@@ -301,6 +314,7 @@ export interface AsyncRunnerStepBuildParams {
 	/** PI_SUBAGENT_TOOL_TIMEOUT_MS override (lowest precedence). */
 	toolTimeoutMsEnv?: string | undefined;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	profiles?: TaskProfile[];
 }
 
 export type AsyncRunnerStepBuildResult =
@@ -313,6 +327,230 @@ export type AsyncRunnerStepBuildResult =
 	}
 	| { error: string };
 
+/**
+ * Map a task profile into the coarse selection input.
+ *
+ * Required capabilities = the union of the profile's declared `capabilities`
+ * (or the kind default when omitted) and `"reasoning"` when `needsReasoning` is
+ * set. They are then intersected with `advertised` — the capabilities any
+ * available model actually advertises (currently `reasoning` and, when the
+ * model's `input` modalities include `"image"`, `vision`). Capabilities no
+ * model advertises (e.g. `"write"`/`"read"`) are treated as advisory: they shape
+ * the task but must not exclude every model and silently disable work candidate
+ * selection. Matchable capabilities are enforced.
+ */
+function toSelectionInput(p: TaskProfile, advertised: Set<string>): SelectionTaskInput {
+	const floor = KIND_DEFAULTS[p.kind]?.contextFloor ?? 16_000;
+	// The kind floor is a HARD minimum context requirement. Clamp the declared
+	// estimatedInputTokens up to the floor (never below) so a small estimate can't
+	// shrink requiredContext and let a sub-floor model (e.g. 4K llama-2-7b) be
+	// selected for a code-write/code-read task where it would overflow.
+	const requiredContext = Math.max(p.estimatedInputTokens ?? floor, floor);
+	const declared = new Set<string>([
+		...(p.capabilities ?? KIND_DEFAULTS[p.kind]?.capabilities ?? []),
+		...(p.needsReasoning ? ["reasoning"] : []),
+	]);
+	const capabilities = [...declared].filter((c) => advertised.has(c));
+	return { id: p.id, requiredContext, capabilities };
+}
+
+/**
+ * Apply task-profile-driven model selection to a built step list.
+ *
+ * Every leaf subagent step (in execution order) is paired with the profile at
+ * the same index. For a parallel group the group's profiles get distinct models
+ * via {@link assignBatchWorkCandidates}; sequential steps each pick a work candidate via
+ * {@link selectWorkCandidate}. The chosen model overrides the step's
+ * `model`/`modelCandidates` so dispatch honours the task-management layer
+ * instead of the static fallback list. Profiles are validated first (as a set,
+ * so intra-profile dependencies resolve); a rejected profile aborts the build.
+ */
+/**
+ * Fallback list length is NOT artificially capped. The runtime retry loop in
+ * `runSingleStep` rotates through *every* candidate in `modelCandidates` and
+ * only stops on a MEANINGFUL condition — the work succeeded, a NON-retryable
+ * error (context overflow, tool failure, non-retryable 400), or a real run/step
+ * timeout. So exhaustion is defined by the task, not by an arbitrary slot count.
+ *
+ * The agent-configured list (inherited parent model + agent.fallbackModels,
+ * already exclusion-filtered) is preserved and the work candidate is prepended,
+ * so the loop falls back across the whole qualified pool on 400/429/503 etc.
+ * A failing model is recorded via `recordModelFailure` (TTL exclusion store), so
+ * it is skipped on subsequent attempts/runs without re-hitting it. There is no
+ * need to pre-truncate the list: if the qualified pool is large, the loop simply
+ * keeps selecting the next candidate and excluding failures until one succeeds or
+ * the pool is genuinely exhausted.
+ */
+
+function applyProfileModels(
+	steps: RunnerStep[],
+	profiles: TaskProfile[],
+	availableModels: AvailableModelInfo[] | undefined,
+	explicitModel?: string,
+	parentModel?: ParentModel,
+	agents?: AgentConfig[],
+): { error?: string } {
+	const knownTaskIds = new Set(profiles.map((p) => p.id));
+	for (const profile of profiles) {
+		const result = validateTaskProfile(profile, knownTaskIds);
+		if (result.rejected) {
+			return { error: `Invalid task profile "${profile.id ?? "?"}:" ${result.issues.map((i) => i.message).join("; ")}` };
+		}
+	}
+
+	// Live planning stage: the dependsOn graph must be acyclic and must respect
+	// the runner step execution order. The topological planner (planBatches) is
+	// the canonical task planner; its ordered batches give us both a cycle gate
+	// and a structural ordering check. Per-profile validators catch undeclared
+	// dependencies, and planBatches rejects cycles; here we also verify that the
+	// dispatched step tree orders every dependency before its dependent.
+	const plan = planBatches(profiles);
+	if (!plan.ok) {
+		const cycle = plan.cycle?.join(" → ") ?? "(unknown cycle)";
+		return { error: `Invalid task profile graph: cyclic dependency detected: ${cycle}` };
+	}
+
+	const leaves: { step: RunnerSubagentStep; group: number; index: number }[] = [];
+	const groups: { steps: RunnerSubagentStep[]; leafIndices: number[] }[] = [];
+	let leafIndex = 0;
+	for (const step of steps) {
+		if (isParallelGroup(step)) {
+			const gi = groups.length;
+			const entry: { steps: RunnerSubagentStep[]; leafIndices: number[] } = { steps: step.parallel, leafIndices: [] };
+			for (const leaf of step.parallel) {
+				leaves.push({ step: leaf, group: gi, index: leafIndex });
+				entry.leafIndices.push(leafIndex);
+				leafIndex++;
+			}
+			groups.push(entry);
+		} else if (isDynamicRunnerGroup(step)) {
+			// Dynamic fan-out count is unknown until runtime; profiles are not applied.
+			continue;
+		} else {
+			leaves.push({ step, group: -1, index: leafIndex });
+			leafIndex++;
+		}
+	}
+
+	if (leaves.length !== profiles.length) {
+		return {
+			error: `profiles length (${profiles.length}) must match the number of dispatched subagent steps (${leaves.length})`,
+		};
+	}
+
+	// Profiles must be unique and aligned positionally with `leaves` (profiles[i]
+	// <-> leaves[i], the step dispatch order). We build the id->leafIndex map from the
+	// SAME index source the assignment loop below uses (`profiles[leaf.index]`) so
+	// validation and assignment can never diverge. Duplicate ids would collapse the
+	// map key, so reject them up front.
+	const profileIdSet = new Set(profiles.map((pr) => pr.id));
+	if (profileIdSet.size !== profiles.length) {
+		return { error: "Invalid task profiles: profile ids must be unique." };
+	}
+	const leafIndexById = new Map<string, number>();
+	for (const leaf of leaves) {
+		const profile = profiles[leaf.index];
+		if (!profile) continue;
+		leafIndexById.set(profile.id, leaf.index);
+	}
+	for (const profile of profiles) {
+		const currentIndex = leafIndexById.get(profile.id);
+		if (currentIndex === undefined) continue;
+		for (const dep of profile.dependsOn) {
+			const depIndex = leafIndexById.get(dep);
+			if (depIndex === undefined) continue;
+			if (depIndex >= currentIndex) {
+				return {
+					error: `Invalid task profile graph: task '${profile.id}' depends on '${dep}', but the dependency is not executed before it.`,
+			};
+			}
+		}
+	}
+
+	const selectable = (availableModels ?? []).map(toSelectableModel).filter((m): m is SelectableModel => m !== null);
+	const advertised = new Set<string>();
+	for (const m of selectable)
+		for (const c of m.capabilities)
+			advertised.add(c);
+	const excluded = new Set(
+		(availableModels ?? [])
+			.filter((m) => {
+				const key = parseModelKey(m.fullId);
+				return isExcluded(key.modelId, key.provider ?? m.provider);
+			})
+			.map((m) => m.fullId),
+	);
+
+	// In FEATURE mode (no explicit model), exclude the parent (orchestrator) from the
+	// selectable pool so it is never chosen as a primary work candidate - it is only a
+	// last-resort fallback. In MAIN mode (explicit model) the pool is untouched.
+	const parentFullId = parentModel ? `${parentModel.provider}/${parentModel.id}` : undefined;
+	const selectablePool = explicitModel || !parentFullId ? selectable : selectable.filter((m) => m.fullId !== parentFullId);
+
+	const assignments: (string | undefined)[] = new Array(leafIndex).fill(undefined);
+	for (const group of groups) {
+		const groupProfiles = group.leafIndices.map((li) => toSelectionInput(profiles[li]!, advertised));
+		const assigned = assignBatchWorkCandidates(groupProfiles, selectablePool, excluded);
+		if (assigned.poolUndersized) {
+			console.warn(poolUndersizeMessage(groupProfiles.length, selectablePool.length, assigned));
+		}
+		group.leafIndices.forEach((li) => {
+			assignments[li] = assigned.assignments.get(profiles[li]!.id);
+		});
+	}
+	for (const leaf of leaves) {
+		if (leaf.group !== -1) continue;
+		assignments[leaf.index] = selectWorkCandidate(toSelectionInput(profiles[leaf.index]!, advertised), selectablePool, excluded);
+	}
+
+	leaves.forEach((leaf) => {
+		const profile = profiles[leaf.index]!;
+		// An explicit per-profile model, OR a model pre-assigned by the foreground batch
+		// assignment (leaf.step.model), OR a top-level override is authoritative.
+		// Otherwise fall back to the batch-diverse work candidate pick.
+		const model = leaf.step.model ?? profile.model ?? explicitModel ?? assignments[leaf.index];
+		// Annotate the leaf step with its task-profile id so the runtime can map a
+		// failed step back to its profile and surface blocked dependents.
+		leaf.step.profileId = profile.id;
+		if (model) {
+			leaf.step.model = model;
+			const existing = Array.isArray(leaf.step.modelCandidates) ? leaf.step.modelCandidates : [];
+			// The fallback pool is qualified (task capabilities + context) only when no
+			// explicit fallbackModels are declared - that is the feature fallback policy.
+			// When fallbackModels ARE pinned (main behavior) the declared list is preserved
+			// exactly and not re-qualified.
+			const agentCfg = agents?.find((a) => a.name === leaf.step.agent);
+			const hasExplicitFallbacks = Array.isArray(agentCfg?.fallbackModels) && agentCfg.fallbackModels.length > 0;
+			const qualifyPool = !hasExplicitFallbacks;
+			let pool = existing.filter((m) => m !== model);
+			if (qualifyPool) {
+				const selectionInput = toSelectionInput(profile, advertised);
+				const qualified = new Set(
+					(availableModels ?? [])
+						.map(toSelectableModel)
+						.filter((m): m is SelectableModel => modelQualifies(m, selectionInput.capabilities, selectionInput.requiredContext))
+						.map((m) => m.fullId),
+				);
+				pool = pool.filter((m) => qualified.has(m));
+			}
+			// The inherited parent is the orchestrator (planning/decomposition); task work
+			// is delegated to pool models, so the parent is the LAST-RESORT candidate -
+			// appended at the end after the qualified pool (or moved there if already present).
+			if (parentFullId && !model.includes(parentFullId)) {
+				const idx = pool.indexOf(parentFullId);
+				if (idx !== -1) { const c = pool.slice(); c.push(c.splice(idx, 1)[0]!); pool = c; }
+				else pool = [...pool, parentFullId];
+			}
+			// No hard cap: rotate through the entire qualified pool. The retry loop in
+			// runSingleStep defines exhaustion by meaningful conditions (success, non-retryable
+			// error, context overflow, or a real timeout), not by a slot count. A failed
+			// candidate is recorded into the TTL exclusion store so it is skipped next time.
+			leaf.step.modelCandidates = [model, ...pool];
+		}
+	});
+
+	return {};
+}
 export function formatAsyncStartedMessage(headline: string, interactive: boolean): string {
 	const guidance = interactive
 		? [
@@ -867,6 +1105,9 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			modelCandidates: externalRunner ? undefined : buildModelCandidates(primaryModel, a.fallbackModels, availableModels, ctx.currentModelProvider, {
 				scope: modelScopes,
 				primaryModelFromParent,
+				// No profiles yet on the legacy path: qualify with the legacy floor so a
+				// fallback pool never silently includes models too small for the task.
+				qualification: { requiredCapabilities: [], minContext: LEGACY_FALLBACK_MIN_CONTEXT },
 			}).map((candidate) =>
 				applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined),
 			),
@@ -935,6 +1176,12 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 					if (!s.worktree || params.progressDir) writeInitialProgressFile(progressDir);
 					progressInstructionCreated = true;
 				}
+				// Task-management: cap all-scout fan-out so one scout pool isn't saturated
+				// by a large parallel group running the same model concurrently.
+				const isScoutFanout = s.parallel.every((task) => task.agent === "scout");
+				const concurrency = isScoutFanout
+					? Math.min(s.concurrency ?? 10, SCOUT_MAX_FANOUT)
+					: (s.concurrency ?? 10);
 				return {
 					parallel: s.parallel.map((t, taskIndex) => {
 						let behaviorCwd: string | undefined;
@@ -948,7 +1195,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 						const staticStep = nextFlatStep();
 						return buildSeqStep({ ...t, agentContract: t.agentContract ?? s.agentContract, gateOn: t.gateOn ?? s.gateOn }, staticStep.sessionFile, behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], staticStep.index, { stepIndex, taskIndex }, resultMode === "parallel" ? `tasks[${taskIndex}]` : `chain[${stepIndex}].parallel[${taskIndex}]`);
 					}),
-					concurrency: s.concurrency,
+					concurrency,
 					failFast: s.failFast,
 					worktree: s.worktree,
 				};
@@ -964,11 +1211,16 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				const maxItems = s.expand.maxItems ?? params.dynamicFanoutMaxItems ?? 0;
 				const dynamicFlatSteps = Array.from({ length: maxItems }, () => nextFlatStep());
 				const parallel = buildSeqStep({ ...(s.parallel as SequentialStep), agentContract: s.parallel.agentContract ?? s.agentContract, gateOn: s.parallel.gateOn ?? s.gateOn }, undefined, undefined, progressPrecreated, behavior, undefined, { stepIndex });
+				// Task-management: cap dynamic scout fan-out to SCOUT_MAX_FANOUT (same-model saturation guard).
+				const isScoutFanout = s.parallel.agent === "scout";
+				const concurrency = isScoutFanout
+					? Math.min(s.concurrency ?? 10, SCOUT_MAX_FANOUT)
+					: (s.concurrency ?? 10);
 				return {
 					expand: s.expand,
 					parallel,
 					collect: s.collect,
-					concurrency: s.concurrency,
+					concurrency,
 					failFast: s.failFast,
 					phase: s.phase,
 					label: s.label,
@@ -1030,6 +1282,13 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				}
 				seen.set(task.outputPath, { index, agent: task.agent });
 			}
+		}
+		// Task-management: apply profiles (batch-diverse work candidates) to the planned
+		// steps before the runner sees them. A rejected profile (bad graph, length
+		// mismatch, invalid field) aborts the build.
+		if (params.profiles) {
+			const profileResult = applyProfileModels(steps as RunnerStep[], params.profiles, params.availableModels, undefined, ctx.currentModel, agents);
+			if (profileResult.error) return { error: profileResult.error };
 		}
 		return { steps: steps as RunnerStep[], runnerCwd, workflowGraph, eventChain: graphChain, ...(originalTask !== undefined ? { originalTask } : {}) };
 	} catch (error) {
@@ -1122,6 +1381,7 @@ export function executeAsyncChain(
 		configToolTimeoutMs: params.configToolTimeoutMs,
 		toolTimeoutMsEnv: params.toolTimeoutMsEnv ?? toolTimeoutFromEnv(),
 		capabilityCeiling,
+		profiles: params.profiles,
 	});
 	if ("error" in built) {
 		try {
@@ -1157,6 +1417,7 @@ export function executeAsyncChain(
 			{
 				id,
 				steps,
+				profiles: params.profiles,
 				resultPath: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : resultFilePath(DIRS.results, id),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
@@ -1457,7 +1718,52 @@ export function executeAsyncSingle(
 			{ scope: modelScopes },
 		);
 	const effectiveThinking = externalRunner ? undefined : params.thinkingOverride ?? agentConfig.thinking;
-	const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, params.thinkingOverride !== undefined);
+	let model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, params.thinkingOverride !== undefined);
+	let workCandidate: string | undefined;
+	// Task qualification (capabilities + required context) used to restrict the dynamic
+	// fallback pool to models that can actually do the job. Set only when a profile exists.
+	let qualification: { requiredCapabilities: string[]; minContext: number } | undefined;
+	// MAIN behavior: an explicit model (per-profile, agent config, or top-level override)
+	// is authoritative and skips feature selection. Computed up-front so it is also
+	// available when building the fallback candidate list below.
+	const explicitModel = params.modelOverride ?? (params.profiles?.[0]?.model) ?? agentConfig.model;
+	if (params.profiles && params.profiles.length > 0) {
+		const profile = params.profiles[0]!;
+		const validated = validateTaskProfile(profile, new Set(params.profiles.map((p) => p.id)));
+		if (validated.rejected) {
+			return formatAsyncStartError("single", `Invalid task profile "${profile.id ?? "?"}: ${validated.issues.map((i) => i.message).join("; ")}`);
+		}
+		const selectable = (availableModels ?? []).map(toSelectableModel).filter((m): m is SelectableModel => m !== null);
+		const advertised = new Set<string>();
+		for (const m of selectable)
+			for (const c of m.capabilities)
+				advertised.add(c);
+		const excluded = new Set(
+			(availableModels ?? []).filter((m) => {
+				const key = parseModelKey(m.fullId);
+				return isExcluded(key.modelId, key.provider ?? m.provider);
+			}).map((m) => m.fullId),
+		);
+		// Derive the task qualification so the dynamic fallback pool is restricted to
+		// models that advertise the required capabilities and have enough context.
+		const selectionInput = toSelectionInput(profile, advertised);
+		qualification = { requiredCapabilities: selectionInput.capabilities, minContext: selectionInput.requiredContext };
+		// In FEATURE mode, exclude the parent (orchestrator) from the selectable pool so it
+		// is never chosen as the primary work candidate - it is only a last-resort fallback.
+		// In MAIN mode (explicit model) the pool is untouched.
+		const parentFullId = ctx.currentModel ? `${ctx.currentModel.provider}/${ctx.currentModel.id}` : undefined;
+		const selectablePool = explicitModel || !parentFullId ? selectable : selectable.filter((m) => m.fullId !== parentFullId);
+		if (!explicitModel) {
+			// FEATURE behavior: no explicit model -> pick free + cheapest from the pool
+			// (dynamic selection policy). This is skipped when a model is pinned, so the
+			// static/declarative main behavior is preserved exactly.
+			workCandidate = selectWorkCandidate(selectionInput, selectablePool, excluded);
+			if (workCandidate) {
+				model = applyThinkingSuffix(workCandidate, effectiveThinking, params.thinkingOverride !== undefined);
+			}
+		}
+		// else: model stays as primaryModel (explicit or inherited parent) - main behavior.
+	}
 	const toolBudgetInput = params.toolBudget ?? agentConfig.toolBudget ?? params.configToolBudget;
 	const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, params.toolBudget ? "toolBudget" : agentConfig.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 	if (resolvedToolBudget.error) return formatAsyncStartError("single", resolvedToolBudget.error);
@@ -1480,16 +1786,35 @@ export function executeAsyncSingle(
 	const structuredOutput = params.structuredOutputSchema
 		? createStructuredOutputRuntime(params.structuredOutputSchema, path.join(asyncDir, "structured-output"))
 		: undefined;
+	// Build the fallback candidate list: the resolved primary model leads (workCandidate when
+	// FEATURE selection picked one), followed by the qualified dynamic pool, then
+	// agent-configured fallbacks. The retry loop in subagent-runner.ts iterates this list
+	// on 429/400/503 failures so the run can rotate through the pool.
+	const primaryCandidate = workCandidate ?? primaryModel;
 	const modelCandidates = externalRunner
 		? []
-		: buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider, {
-			scope: modelScopes,
-			primaryModelFromParent: params.modelOverrideFromParent,
-		})
-			.flatMap((candidate) => {
-				const resolved = applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined);
-				return resolved ? [resolved] : [];
-			});
+		: filterFallbackCandidates(
+			buildModelCandidates(primaryCandidate, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider, {
+				scope: modelScopes,
+				primaryModelFromParent: params.modelOverrideFromParent,
+				qualification,
+			}),
+		).flatMap((candidate) => {
+			const resolved = applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined);
+			return resolved ? [resolved] : [];
+		});
+	// In FEATURE mode (no explicit model pinned), include the inherited parent model as the
+	// LAST-RESORT fallback candidate (appended at the end, after all qualified pool models).
+	// The parent is the orchestrator (planning/decomposition); task work is delegated to
+	// free/cheap QUALIFIED pool models, so the parent is only used when no qualified pool
+	// model remains. Skipped entirely when a model is pinned (main behavior).
+	if (!externalRunner && !explicitModel && ctx.currentModel) {
+		const parentFullId = `${ctx.currentModel.provider}/${ctx.currentModel.id}`;
+		const parentWithSuffix = applyThinkingSuffix(parentFullId, effectiveThinking, params.thinkingOverride !== undefined);
+		if (parentWithSuffix && !modelCandidates.includes(parentWithSuffix)) {
+			modelCandidates.push(parentWithSuffix);
+		}
+	}
 	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(systemPrompt, params.turnBudget);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
@@ -1604,6 +1929,7 @@ export function executeAsyncSingle(
 		spawnResult = spawnRunner(
 			{
 				id,
+				profiles: params.profiles,
 				steps: [
 					{
 						parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
