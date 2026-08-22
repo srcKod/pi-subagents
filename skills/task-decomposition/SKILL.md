@@ -8,8 +8,9 @@ description: Decompose work into TaskProfiles for parallel subagent dispatch —
 > **Port note (v2).** This skill was written against pi-subagents v0.40.x. The
 > task-management feature it documents has since been ported to v0.46.0+ and
 > reworked. All API names, defaults, and behaviors below reflect the **v2**
-> implementation (`src/runs/shared/schemas.ts`, `task-validators.ts`,
-> `task-model-selection.ts`, `model-capabilities.ts`, `model-fallback.ts`,
+> implementation (`src/shared/types.ts`, `src/runs/shared/task-profile.ts`,
+> `task-context-floor.ts`, `task-validators.ts`, `task-planner.ts`,
+> `work-candidate-selection.ts`, `model-capabilities.ts`, `model-fallback.ts`,
 > `model-exclusions.ts`). The **Lessons** section is preserved verbatim from the
 > original — its principles still hold even where file paths have moved.
 
@@ -42,17 +43,18 @@ interface TaskProfile {
   id: string;
   kind: 'code-write' | 'code-read' | 'transform' | 'summarize' | 'search';
   task: string;                       // full self-contained instructions
-  dependsOn?: string[];               // IDs of tasks that must finish first
-  acceptanceCriteria: string[];       // machine-checkable done conditions
-  model?: string;                     // explicit pin (highest precedence)
+  dependsOn: string[];                // IDs of tasks that must finish first
+  acceptanceCriteria: string[];       // machine-checkable done conditions (>=1)
+  model?: string;                     // explicit pin (overrides work-candidate selection)
   needsReasoning?: boolean;           // adds 'reasoning' capability requirement
-  stakes?: 'normal' | 'high';         // high → stricter validation, wider floors
-  toolBudget?: { maxToolCalls?: number; maxReads?: number; blockedTools?: string[] };
+  stakes?: 'normal' | 'high';         // high gates an opt-in verifier subagent that
+                                      //   re-checks acceptance criteria on a cheap model
+  toolBudget?: { hard: number; soft?: number; block: '*' | string[] };
   tokenBudget?: number;               // output token ceiling for the child
   contextFloor?: number;              // minimum usable context required
-  capabilities?: ModelCapability[];   // e.g. ['vision'] in addition to kind defaults
+  capabilities?: string[];            // e.g. ['vision'] in addition to kind defaults
   estimatedInputTokens?: number;      // your own estimate of child input size
-  testBaseClass?: string;             // base class/path the child must extend
+  testBaseClass?: 'pest' | 'phpunit' | 'jest' | 'vitest' | 'none';
 }
 ```
 
@@ -71,13 +73,18 @@ not participate in model choice except via `requiredContext`.
 
 ### Kind defaults (v2)
 
-| Kind         | Context floor | Token budget | Tool calls (normal/high) | Default blocked tools |
-|--------------|--------------:|-------------:|-------------------------|-----------------------|
-| code-write   | 8,192         | 65,536       | 80 / 120                | none                  |
-| code-read    | 16,384        | 32,768       | 60 / 90                 | write, edit           |
-| transform    | 4,096         | 16,384       | 40 / 60                 | none                  |
-| summarize    | 2,048         | 8,192        | 20 / 30                 | ctx_execute           |
-| search       | 6,144         | 16,384       | 40 / 60                 | write, edit           |
+Floors live in `CONTEXT_FLOOR_BY_KIND` (`task-context-floor.ts`); budgets in
+`KIND_DEFAULTS` (`task-profile.ts`). `hard` blocks the tool call outright once
+exhausted; `block` lists which tools are denied *after* the hard cap (`"*"` =
+all of them).
+
+| Kind         | Context floor | Token budget | Tools hard / soft | Post-cap block          |
+|--------------|--------------:|-------------:|-------------------|-------------------------|
+| code-write   | 8,000         | 64,000       | 80 / 40           | `"*"` (all tools)       |
+| code-read    | 16,000        | 32,000       | 60 / 30           | read, grep, find, ls    |
+| transform    | 4,000         | 16,000       | 40 / 20           | `"*"` (all tools)       |
+| summarize    | 2,000         | 8,000        | 20 / 10           | read, grep, find, ls, ctx_execute |
+| search       | 6,000         | 16,000       | 40 / 20           | read, grep, find, ls    |
 
 `CONTEXT_CEILING` is 50,000 estimated input tokens — profiles above it are
 rejected outright (see Guardrails).
@@ -195,8 +202,12 @@ Where the machinery lives after the port:
   with fallback; `isContextOverflow` ("input too large") is deliberately
   terminal — shrinking context mid-flight corrupts results, so overflow fails
   the leaf loudly instead of silently retrying smaller.
-- Failure propagation: `blockedDependentsOnFailure(failedId, profiles)` marks
-  downstream dependents blocked; surfaced on async status.
+- Failure propagation: `blockedDependentsOnFailure(failedId, profiles)` in
+  `task-planner.ts` marks downstream dependents blocked; surfaced on async status.
+- Uniform-CRUD shortcut: when every leaf in a batch shares one kind and their
+  `estimatedInputTokens` are within 50% of each other, `isUniformCRUD`
+  (`task-profile.ts`) routes the batch to parent-direct execution instead of
+  parallel dispatch — deliberate homogeneity reads as mechanical work.
 
 Model resolution order per leaf:
 `leaf.step.model` → `profile.model` → explicit override → assignment from the
@@ -223,7 +234,7 @@ lesson #1. Append below this marker.)*
 ### [2026-07-26] [model selection] [exclusion/fallback test-validity]
 **Task shape**: testing the exclusion/fallback feature (a model 400/429/503 → recorded exclusion → rotate to next candidate).
 **Failure**: a re-run on a healthy pool completed but never exercised exclusions; an earlier run that pinned `hy3` masked the diverse pool entirely.
-**Root cause**: exclusion/fallback only triggers when a pool member actually fails. A clean run (or a forced single model) proves nothing about rotation. Champion selection picks the cheapest free qualifier, so forcing one model removes the diversity the feature needs.
+**Root cause**: exclusion/fallback only triggers when a pool member actually fails. A clean run (or a forced single model) proves nothing about rotation. Work-candidate selection (`selectWorkCandidate`) picks the cheapest free qualifier, so forcing one model removes the diversity the feature needs.
 **Fix**: when validating exclusion/fallback, dispatch with NO model pin and ensure at least one pool member is a model that will fail (400/429/503). A green run on a healthy pool is not evidence the exclusion path works — look for the exclusion being recorded + the next candidate tried.
 **Reusable signal**: "feature test passed but no model ever failed" → you didn't exercise exclusions; pin nothing or inject a known-bad model.
 
@@ -239,7 +250,7 @@ lesson #1. Append below this marker.)*
 **Failure**: nested delegation died with `Tool subagent not found` because the child wasn't armed with the subagent tool; a naive fix referenced an undefined variable and killed every step.
 **Root cause**: nested-subagent depth is computed from `PI_SUBAGENT_DEPTH` propagated through the spawn env. The async runner inherits the orchestrator's depth (UNSET → 0), so chain workers sit at depth 1; under default `maxSubagentDepth=2` a depth-1 worker MAY delegate (depth-2 child) — but only if armed with the subagent tool + extension. The depth math must be checked against the actual spawn code, not assumed.
 **Fix**: if you add a chain step that should delegate, verify the depth arithmetic in the spawn path: a step at depth D can delegate only if `D+1 < maxSubagentDepth` AND it is armed (subagent tool + pi-subagents extension loaded). Confirm via a live run that the child emits a `subagent` tool_use, not by reasoning alone.
-**Reusable signal**: "verify/nested step should delegate but dies on `Tool subagent not found`" → the child wasn't armed; check `allowNestedSubagents` depth math in `buildPiArgs`/`runSingleStep`.
+**Reusable signal**: "verify/nested step should delegate but dies on `Tool subagent not found`" → the child wasn't armed; check the `PI_SUBAGENT_DEPTH` vs `DEFAULT_SUBAGENT_MAX_DEPTH` math (`checkSubagentDepth` in `src/shared/types.ts`) in `buildPiArgs`/`runSingleStep`.
 
 ### [2026-07-26] [repro] [chain-definition-loss]
 **Task shape**: re-running a previously-aborted decomposition chain to confirm a fix.
@@ -281,7 +292,7 @@ used instead) rather than guessing a count.
 **Task shape**: testing the model-fallback retry loop in `runSingleStep` (budget caps: maxModelAttempts / maxRunCost / maxRunTokens; rotate-through-pool on 400/429/503).
 **Failure**: the first attempt was a `test/integration/budget-stress.test.ts` that never called `runSingleStep`, re-declared `attemptedModels` fresh on every loop iteration, and left `step.maxModelAttempts` undefined — so it would have PASSED vacuously (the `assert.ok(exhausted)` could never fire) and proved nothing.
 **Root cause**: an integration test that stubs the whole executor can't see the retry loop. The loop only runs when `runSingleStep` actually invokes its `piRunner` and processes `attempt.success` / retryable `error` / `usage` across attempts.
-**Fix**: drive the loop directly with a fake `piRunner` that returns `{ exitCode: 1, error: "400 Bad Request", usage: { input, output, cost, ... }, model, ... }` and assert on the call count (`calls.length === N`). Retryable errors match `/\b400\b|\b429\b|\b503\b/`. This lives in `test/unit/budget.test.ts` and runs via `node --experimental-strip-types --test`.
+**Fix**: drive the loop directly with a fake `piRunner` that returns `{ exitCode: 1, error: "400 Bad Request", usage: { input, output, cost, ... }, model, ... }` and assert on the call count (`calls.length === N`). Retryable errors match `/\b400\b|\b429\b|\b503\b/`. In v2 this coverage lives in `test/unit/model-fallback.test.ts` (exclusion recorded after a retryable failure) and `test/integration/single-execution.test.ts` (executor-level fallback models), run via `node --experimental-strip-types --test`.
 **Reusable signal**: "fallback/budget test passes" → confirm it actually exercised `runSingleStep`'s retry loop (assert on attempt count), not just imported the executor.
 
 ### [2026-07-27] [editing] [CRLF / exact-match fragility]
@@ -295,7 +306,7 @@ used instead) rather than guessing a count.
 **Task shape**: a root-level `test-config-budget.test.ts` intended to validate config-file budget defaults.
 **Failure**: it wrote directly to the real `~/.pi/agent/extensions/subagent/config.json` and was never picked up by `test:unit` / `test:integration` (it sat at repo root), so it mutated user state on every run and provided zero CI coverage.
 **Root cause**: a test that touches real config is a side-effecting liability; placing it outside the `test/` tree means no script runs it.
-**Fix**: never let a test write the real extension config. Either cover the config-merge path with a temp config under `test/integration/`, or delete the orphan and rely on the runtime-loop unit test (`test/unit/budget.test.ts`). Prefer runtime-loop coverage over config-file mutation.
+**Fix**: never let a test write the real extension config. Either cover the config-merge path with a temp config under `test/integration/`, or delete the orphan and rely on the runtime-loop unit test (`test/unit/model-fallback.test.ts`). Prefer runtime-loop coverage over config-file mutation.
 **Reusable signal**: "a test at repo root mutates ~/.pi config" → it's an orphan; relocate under test/ with a temp config or delete it.
 
 ### [2026-07-27] [git-hygiene] [interleaved atomic commits]
@@ -324,7 +335,7 @@ used instead) rather than guessing a count.
 ### [2026-08-04] [model selection] [async-path-bug / batch-diversity]
 **Task shape**: parallel reviewer dispatch with asyncByDefault=true, expecting assignBatchWorkCandidates to assign diverse models.
 **Failure**: all 4 subagents inherited the parent model. maxPerModel=2 cap never landed.
-**Root cause**: Async dispatch (subagent-executor.ts:3086) used behaviorOverrides[i]?.model (parent-derived) instead of modelOverrides[i] (batch-assigned). Assignments computed but discarded.
+**Root cause**: Async dispatch (src/runs/foreground/subagent-executor.ts) used behaviorOverrides[i]?.model (parent-derived) instead of modelOverrides[i] (batch-assigned). Assignments computed but discarded.
 **Fix**: Use modelOverrides[i]. Verify by output logs, not load.log.
 **Reusable signal**: all parallel subagents same model -> check async path uses modelOverrides[i].
 
