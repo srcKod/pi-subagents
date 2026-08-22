@@ -1,311 +1,207 @@
 ---
 name: task-decomposition
-description: |
-  Shape work into standalone, weak-model-digestible tasks before dispatching to
-  subagents. Use whenever a project or multi-step request needs decomposition
-  into a task graph (parallel, chain, or mixed). Provides the decomposition
-  intelligence that the task-management framework validates: how to classify
-  task kinds, declare dependencies, write checkable acceptance criteria, and
-  avoid the failure modes (implicit context, undeclared deps, oversized tasks)
-  that cause context overflow and dead subagents. Triggers: "break this down",
-  "split into tasks", "decompose", "parallelize", "plan the work",
-  "task graph", "divide and conquer", multi-step project dispatch, any time
-  more than one subagent will be launched for a single goal. This skill
-  accumulates decomposition lessons over time — check the Lessons section and
-  memory before decomposing.
+description: Decompose work into TaskProfiles for parallel subagent dispatch — when to decompose, how to size and type tasks, how model selection works, and what the validators will reject.
 ---
 
 # Task Decomposition
 
-> This is the **mutable intelligence layer** of the task-management architecture.
-> The framework (validators, work candidate selection, exclusions) is immutable scaffolding.
-> This skill is the only part that needs to be good — and it improves through
-> curation, not code changes. Append lessons as you learn them.
+> **Port note (v2).** This skill was written against pi-subagents v0.40.x. The
+> task-management feature it documents has since been ported to v0.46.0+ and
+> reworked. All API names, defaults, and behaviors below reflect the **v2**
+> implementation (`src/runs/shared/schemas.ts`, `task-validators.ts`,
+> `task-model-selection.ts`, `model-capabilities.ts`, `model-fallback.ts`,
+> `model-exclusions.ts`). The **Lessons** section is preserved verbatim from the
+> original — its principles still hold even where file paths have moved.
 
 ## The One Principle
 
-**Design for the weakest model that will run the task.**
+Decompose so that each subagent gets **one task, one context, one budget** — and
+so that the parent never blocks on a child.
 
-A well-decomposed task succeeds on any qualifying free model. A poorly-decomposed
-task fails on expensive models too — it just costs more before it dies. The
-framework picks the cheapest model that qualifies; your job is to make the task
-survivable on that model. Decomposition quality is the whole bet.
+A task profile is a *contract*, not a prompt. It declares what "done" looks like,
+what kind of work it is, and what resources it needs. The runtime turns those
+declarations into budgets, model candidates, dependency ordering, and failure
+handling. Your job as the decomposer is to make the contract precise enough that
+the machinery can do its job.
 
-Precision on "weakest/cheapest": the framework's actual selection is the **cheapest free model that qualifies** by cost, context-window, and capability tags — it does NOT rank by output quality. So a model being merely "good enough" (e.g. a mid-tier free model) is the expected, intended outcome, not a deficiency to work around. Likewise, the framework's acceptance scoring is structural/schema-based, not a judgment of output quality: a correct result can be scored "rejected" on shape (e.g. a missing required evidence field), which is a false negative, not proof the task failed. See the [acceptance] [false-negative] lesson.
+**On model selection precision:** selection is *cheapest-free-that-qualifies*,
+then cheapest-paid, with free-vs-paid decided per-model by `isFree` (zero
+advertised cost or a name containing `free`) — not by a global "free tier"
+notion. Context qualification uses `modelQualifies`: the model's advertised
+context window must cover `requiredContext + COMPACTION_RESERVE` (16,384), where
+`requiredContext = max(estimatedInputTokens, kindFloor)` and the kind floor comes
+from `KIND_DEFAULTS` (fallback 16,000). Capability matching intersects declared
+needs (`capabilities`, plus `reasoning` when `needsReasoning`) with advertised
+model capabilities. If no candidate qualifies, the parent model remains the
+last-resort executor — decomposition degrades gracefully rather than failing.
 
 ## The Contract
 
-When you decompose, you produce a list of **TaskProfile** objects. Each has:
-
+```ts
+interface TaskProfile {
+  id: string;
+  kind: 'code-write' | 'code-read' | 'transform' | 'summarize' | 'search';
+  task: string;                       // full self-contained instructions
+  dependsOn?: string[];               // IDs of tasks that must finish first
+  acceptanceCriteria: string[];       // machine-checkable done conditions
+  model?: string;                     // explicit pin (highest precedence)
+  needsReasoning?: boolean;           // adds 'reasoning' capability requirement
+  stakes?: 'normal' | 'high';         // high → stricter validation, wider floors
+  toolBudget?: { maxToolCalls?: number; maxReads?: number; blockedTools?: string[] };
+  tokenBudget?: number;               // output token ceiling for the child
+  contextFloor?: number;              // minimum usable context required
+  capabilities?: ModelCapability[];   // e.g. ['vision'] in addition to kind defaults
+  estimatedInputTokens?: number;      // your own estimate of child input size
+  testBaseClass?: string;             // base class/path the child must extend
+}
 ```
-DECLARED (you fill these):
-  id            — stable handle (e.g. "auth-1", "migrate-read")
-  kind          — one of: code-write | code-read | transform | summarize | search
-  task          — the full, self-contained instruction
-  dependsOn[]   — ids of tasks that must complete before this one starts
-  acceptanceCriteria[] — checkable success conditions (NOT "works correctly")
-  needsReasoning? — true only if the task requires hard reasoning (default false)
-  stakes?       — "high" only for critical tasks; the opt-in verifier is a future hook (v1 is failure-only by default)
 
-DERIVED (framework fills, you can only raise estimates):
-  toolBudget, tokenBudget, contextFloor, capabilities — from kind defaults
-                (only matchable capabilities are enforced in selection — currently "reasoning";
-                 the rest are advisory, not model-exclusion filters)
+**What actually reaches the model selector** (v2): only `profile.model` is read
+directly. Everything else flows through `toSelectionInput(profile)`, which
+computes:
 
-VALIDATED (framework checks, may reject):
-  estimatedInputTokens — your guess; bumped to floor if below kind minimum
-  standalone-ness      — no "the above", "as mentioned", "its output", "previous"
-  dep-completeness     — every task you reference in text must be in dependsOn
-  kind-consistency     — declared kind must match task-text signals
-```
+- `requiredContext` — `max(estimatedInputTokens ?? floor, floor)` where
+  `floor = KIND_DEFAULTS[kind]?.contextFloor ?? 16_000`
+- `capabilities` — union of declared capabilities and `reasoning` if
+  `needsReasoning`; the selector then intersects with what the model advertises
+
+Fields like `toolBudget`, `tokenBudget`, `stakes`, `contextFloor`, and
+`testBaseClass` are enforced elsewhere (validators, runner budgets) — they do
+not participate in model choice except via `requiredContext`.
+
+### Kind defaults (v2)
+
+| Kind         | Context floor | Token budget | Tool calls (normal/high) | Default blocked tools |
+|--------------|--------------:|-------------:|-------------------------|-----------------------|
+| code-write   | 8,192         | 65,536       | 80 / 120                | none                  |
+| code-read    | 16,384        | 32,768       | 60 / 90                 | write, edit           |
+| transform    | 4,096         | 16,384       | 40 / 60                 | none                  |
+| summarize    | 2,048         | 8,192        | 20 / 30                 | ctx_execute           |
+| search       | 6,144         | 16,384       | 40 / 60                 | write, edit           |
+
+`CONTEXT_CEILING` is 50,000 estimated input tokens — profiles above it are
+rejected outright (see Guardrails).
 
 ## Should You Decompose At All?
 
-Decomposition has a cost: coordination overhead, dependency bookkeeping, and a
-profile per task. Don't pay it for work that's already atomic. **You have the
-full task context — you decide, not the framework.**
+Ask these before creating any TaskProfile:
 
-### Decompose when the task has…
+1. **Would a competent engineer need to hold all of it in their head at once?**
+   If no — don't decompose.
+2. **Are there pieces whose results don't affect each other?** Independent
+   leaves are the parallelism win. If everything feeds everything, a single
+   agent with good notes wins.
+3. **Is any piece dominated by mechanical transformation?** (rename across
+   files, format conversion, bulk find-replace) Those are cheap parallel
+   `transform`/`code-write` leaves.
+4. **Is verification separable from production?** Writing code and auditing it
+   want different contexts. A `code-write` leaf plus an independent review leaf
+   beats one agent doing both.
 
-- **Multiple natural seams** — independent parts, ordered steps, or
-  parallel-safe work that would otherwise run serially in one bloated task.
-- **Heterogeneous resource needs** — one part is a cheap `code-read`, another
-  is a heavy `code-write`. Splitting lets each run on the right model.
-- **A size that risks overflow on a weak model** — if the task would consume
-  most of a 128k window, it's not atomic; split it.
-- **Separate acceptance signals** — the parts have distinct done-conditions,
-  so failure in one doesn't waste the work of the others.
-- **Reusable intermediate output** — one task's output feeds several others
-  (diamond / map-reduce shape). Splitting lets the shared work run once.
-
-### Don't decompose when the task is…
-
-- **Already atomic** — one coherent action, one acceptance signal, fits
-  comfortably in context. Dispatch it as a single task; let the model work.
-- **Tightly coupled** — the parts can't be specified without referencing each
-  other, so decomposition would just add forward-ref violations. Keep it whole.
-- **Smaller than the coordination cost** — a 30-line fix doesn't need a task
-  graph. The overhead of profiling + validating exceeds the work.
-- **Exploratory / undefined** — if you can't write checkable acceptance
-  criteria, you don't understand it yet. Do the work first (or a `search`/`code-read`
-  recon task), then decompose the now-understood result.
-
-### The gate test
-
-Before decomposing, ask: *"If I sent this as a single task to the cheapest
-qualifying model, would it most likely succeed?"*
-
-- **Yes** → don't decompose. Dispatch it. Save the coordination cost.
-- **No, because of size** → decompose by splitting the work.
-- **No, because of structure (ordered / parallel parts)** → decompose by seam.
-- **No, because it's undefined** → don't decompose yet; run a recon task first.
-
-This judgment is yours. The framework won't force decomposition on a single
-task — it profiles and validates whatever you hand it, including a list of one.
-Over-decomposition (splitting atomic work) is as much a failure mode as
-under-decomposition; it wastes coordination budget and creates needless
-dependencies. When in doubt, start coarser and let a runtime overflow signal
-tell you to split.
+If you answered "no" to all four: do the work yourself. Decomposition has real
+cost — coordination overhead, duplicated context loading, merge risk.
 
 ## Decomposition Procedure
 
-### Step 1: Identify the goal and the output
+1. **Identify the deliverable.** What artifact proves the whole task done? Work
+   backwards from acceptance criteria at the top level.
+2. **Find the seams.** Look for: independent modules/files, mechanical sweeps,
+   research questions with no interdependency, verify-after-produce splits.
+3. **Draft leaves first, then dependencies.** Each leaf should be describable in
+   two sentences without referencing sibling leaves' internals.
+4. **Write acceptance criteria per leaf.** Machine-checkable: file exists +
+   contains X, command exits 0, test passes. Not: "looks reasonable".
+5. **Assign kinds honestly.** The kind drives budgets, floors, and default
+   tool blocks — mislabeling a `summarize` task as `code-write` wastes budget
+   and can fail validators (kind/task consistency check).
+6. **Declare dependencies minimally.** Only where a leaf genuinely consumes
+   another's output. Every edge you add serializes the graph. Cycles are
+   rejected before dispatch; undeclared dependencies are rejected too.
+7. **Estimate input tokens roughly.** If a child must read a large file set,
+   say so via `estimatedInputTokens` — this feeds `requiredContext` and keeps
+   small-context models out of the candidate pool. Don't inflate: estimates
+   above `CONTEXT_CEILING` (50,000) are hard-rejected by validators.
+8. **Let the runtime pick models.** Pin `model:` only when you have a reason
+   the selector can't see (license constraints, benchmarked superiority).
 
-Before splitting, state in one sentence: *what artifact does this produce, and
-how will we know it's done?* If you can't, you don't understand the work yet —
-don't decompose.
+## The Guardrails
 
-### Step 2: Find the natural seams
+The v2 validator suite runs before dispatch. Rejections are terminal for the
+profile; some issues are auto-corrected with a warning.
 
-Look for boundaries where:
+| # | Check | Severity |
+|---|-------|----------|
+| V1 | Reject empty `task` or empty `acceptanceCriteria` entries | error |
+| V2 | Estimated input above kind floor → warn, bump floor | warning |
+| V3 | Reject standalone tasks mixed into a batch (use direct spawn) | error |
+| V4 | Reject `dependsOn` pointing at unknown task IDs | error |
+| V5 | Reject `estimatedInputTokens > CONTEXT_CEILING` (50,000) | error |
+| V6 | Warn on vague acceptance criteria ("works", "good", etc.) | warning |
+| V7 | Kind/task consistency heuristic mismatch → warn, auto-correct kind | warning |
 
-- One task's output is another's input (→ declare a dependency)
-- Work is independent and can run in parallel (→ separate tasks, no dep)
-- A sub-task requires different tools or context than its siblings (→ different kind)
-- A sub-task is large enough to overflow a weak model (→ split further)
+Additional build-level gates beyond per-profile validation:
 
-### Step 3: Classify each task's kind
-
-| kind         | when to use                                  | example                                           |
-| ------------ | -------------------------------------------- | ------------------------------------------------- |
-| `code-write` | produces or modifies source files            | "implement the auth middleware"                   |
-| `code-read`  | reads code to extract structure, no mutation | "map all call sites of `foo()`"                   |
-| `transform`  | mechanical in→out, same shape                | "rename `jstore` → `sunet` across all migrations" |
-| `summarize`  | large input → small output                   | "summarize this 200-line log"                     |
-| `search`     | exploratory, finds things                    | "find where the config is loaded"                 |
-
-**Reasoning is not a kind.** If a `code-write` task requires hard reasoning
-(architectural decisions, tricky algorithm), set `needsReasoning: true`. The kind
-describes the *resource shape*; `needsReasoning` describes the *strength need*.
-
-### Step 4: Write self-contained task instructions
-
-Each task must be runnable by a fresh subagent with **zero context from sibling
-tasks**. Rewrite any task that references:
-
-- "the above" / "as mentioned" / "see earlier" → **inline the actual content**
-- "its output" / "the previous task's result" → **either declare a dependency and
-  pass the output, or inline the expected input**
-- "we" / "our" / implicit shared state → **spell out exactly what state**
-
-This is the #1 failure mode. The post-mortem documented it: 3 of 6 parallel
-subagents died because their tasks referenced shared implicit context that the
-weak model couldn't reconstruct. **Every task is an island.**
-
-### Step 5: Declare dependencies explicitly
-
-- If task B needs task A's output: `dependsOn: ["A"]`.
-- If tasks are independent: `dependsOn: []`.
-- The framework topologically sorts these into batches. Independent tasks run in
-  parallel; dependent tasks wait.
-- **Never leave a dependency implicit.** If the task text assumes another task
-  ran, that task id MUST be in `dependsOn` — or the validator rejects it.
-
-### Step 6: Write checkable acceptance criteria
-
-Each task needs at least one condition that a cheap model (or the framework) can
-verify without judgment:
-
-- ✅ "file `src/auth.ts` exists and exports `verifyToken`"
-- ✅ "all call sites of `foo()` are renamed to `bar()`" (grep-checkable)
-- ✅ "migration runs without error on the test DB"
-- ❌ "works correctly" (too vague — validator warns)
-- ❌ "is good" (too vague)
-- ❌ "is complete" (meaningless)
-
-For `stakes: "high"` tasks, criteria should be concrete assertions the future
-opt-in verifier can check — write them as concrete assertions, not vibes (v1 is
-failure-only by default; the verifier is a documented future hook).
-
-### Step 7: Estimate input tokens (be honest)
-
-Give your best guess at the input size. The framework will:
-
-- Bump it to the kind's floor if you under-estimate (non-negotiable).
-- Reject the task if it exceeds the ceiling (~50k) — **this means your split is
-  too coarse; decompose further.**
-
-The estimate is a **decomposition-quality signal**, not a model-fit signal. If
-you're hitting the ceiling, the task is too big for a weak model to digest —
-split it, don't reach for a bigger model.
-
-### Step 8: Check memory for past failures
-
-Before finalizing, search for decomposition failures on similar work:
-
-- `memory_search("decomposition failure")` or `memory_search("<domain> task overflow")`
-- If a similar project failed before, check the **Lessons** section below for the
-  fix.
-- If you hit a new failure during this run, append a lesson (see § Lessons).
-
-## The Guardrails (what the framework rejects, and how to fix)
-
-| #   | Rejection                          | Why                                            | Fix                                                    |
-| --- | ---------------------------------- | ---------------------------------------------- | ------------------------------------------------------ |
-| 1   | Empty task / no criteria           | Can't dispatch without a done-condition        | Write the task + at least one checkable criterion      |
-| 2   | Estimate below floor               | Under-provisioning                             | Auto-corrected; just be more honest next time          |
-| 3   | Not standalone                     | Weak model can't resolve forward refs          | Inline the referenced content or declare the dep       |
-| 4   | Undeclared dependency              | Task assumes another ran but didn't declare it | Add the task id to `dependsOn`, or inline the input    |
-| 5   | Over ceiling (~50k)                | Task too big for weak model                    | Split into 2+ smaller tasks; declare deps between them |
-| 6   | Vague criteria (warn only)         | Can't check "works correctly"                  | Rewrite as a concrete, checkable condition             |
-| 7   | Kind contradiction (override+warn) | Declared kind contradicts task text            | Reclassify; the framework will override and warn you   |
-
-**Validators 3 and 4 are the ones that catch the post-mortem's failure.** They're
-cheap regex checks with outsized value. When the framework rejects your task, it
-returns the *specific* reason — fix exactly that and re-profile.
+- **Cycle gate**: batches are planned over the dependency graph; cycles abort
+  planning before any child spawns.
+- **Leaf counting**: only parallel-ready leaves count toward batch sizing;
+  dynamic fanout groups are skipped in the cycle gate.
+- **Unique IDs + length checks**: duplicate or missing profile IDs, empty
+  batches, and oversized batches fail fast.
 
 ## Decomposition Patterns
 
-Recurring shapes. Use these as starting points, not rigid templates.
+### Fan-out map/reduce
+One coordinator (you) + N independent leaves + optional reduce step.
+Leaves: `kind: 'transform'` or `'code-write'`, no `dependsOn`. Reduce: depends
+on all leaves. Best win: leaves touch disjoint files.
 
-### Linear chain
+### Produce-then-audit
+Leaf A writes; leaf B audits A's output with fresh eyes.
+B: `dependsOn: [A.id]`, often `kind: 'code-read'`. B must NOT reuse A's context
+— that's the entire point.
 
-```
-A → B → C
-```
+### Scout-then-exploit
+Scout maps territory cheaply; exploit acts on findings.
+Scout: `kind: 'search'` or `'summarize'`, tiny budget. In v2, static parallel
+fanout is capped at `SCOUT_MAX_FANOUT = 3` scouts alongside dynamic scout
+spawning — plan scouting accordingly instead of fanning out dozens.
 
-Each task feeds the next. Declare `dependsOn` linearly. Good for: migrations,
-refactors with ordering, build-then-test.
+### Pipeline
+Linear chain where each stage transforms the previous output. Declare strict
+linear `dependsOn`. Prefer this only when stages genuinely cannot start early;
+pipelines serialize everything.
 
-### Parallel fan-out (independent)
+### Batch diversity
+When dispatching a batch in parallel, the runtime deliberately spreads tasks
+across distinct models (with a round-robin cap of 2 tasks per model) so one bad
+model doesn't poison every result. Write leaves so they're individually sound —
+don't rely on cross-task consistency within a batch.
 
-```
-[A, B, C] (no deps between them)
-```
+## Runtime Integration (v2)
 
-All run in one batch. Good for: applying the same transform to different files,
-independent feature implementation. **Batch-diversity**: the framework prefers
-distinct models per task — don't assume all will run on the same model.
+Where the machinery lives after the port:
 
-### Parallel fan-out (shared read, independent write)
+- `src/runs/background/subagent-runner.ts` — async/single-step execution
+  (formerly `subagent-executor.ts`)
+- `src/runs/shared/pi-args.ts` — CLI arg plumbing
+- `src/runs/shared/model-capabilities.ts` — advertised capability/context
+  registry; `isFree`; `toSelectableModel`
+- `src/runs/shared/model-fallback.ts` — `buildModelCandidates` (explicit
+  fallbacks kept verbatim; otherwise dynamic pool sorted free-first then by
+  input cost; parent appended by caller as last resort)
+- `src/runs/shared/model-exclusions.ts` — TTL exclusion store fed by retryable
+  failures
+- Retryable vs terminal: transport/rate-limit/auth/model-missing errors retry
+  with fallback; `isContextOverflow` ("input too large") is deliberately
+  terminal — shrinking context mid-flight corrupts results, so overflow fails
+  the leaf loudly instead of silently retrying smaller.
+- Failure propagation: `blockedDependentsOnFailure(failedId, profiles)` marks
+  downstream dependents blocked; surfaced on async status.
 
-```
-    read
-   /  |  \
-  A   B   C
-```
+Model resolution order per leaf:
+`leaf.step.model` → `profile.model` → explicit override → assignment from the
+qualified pool → parent model as last resort.
 
-One `code-read` task produces a shared artifact (map, index, summary); N
-independent `code-write` tasks depend on it. Good for: "find all call sites,
-then fix each one."
-
-### Diamond
-
-```
-  A
- / \
-B   C
- \ /
-  D
-```
-
-A produces shared context; B and C run in parallel using it; D assembles.
-Good for: research-then-implement-then-integrate.
-
-### Map-reduce
-
-```
-[split] → [map₁, map₂, ..., mapₙ] → [reduce]
-```
-
-One task splits work; N parallel tasks process chunks; one task assembles.
-Good for: bulk transformations across many files. The split task must produce
-**explicit chunk boundaries** (file lists, line ranges) — never "split the work
-evenly" without saying how.
-
-## Runtime Integration (how your tasks run)
-
-### Context shaping — use context-mode
-
-For any task that will process large outputs (logs, test runs, API responses,
-file dumps), instruct the subagent to use context-mode tools (`ctx_execute`,
-`ctx_execute_file`) instead of dumping output into its own context. The
-task instruction should say: *"Analyze the output via ctx_execute; print only
-findings, not raw output."*
-
-This is how the framework keeps weak models from drowning in runtime context —
-not by picking a bigger model, but by shaping the context at runtime via the
-existing context-mode package.
-
-### Tool budgets
-
-Each kind has a default tool budget. For tasks that need more (heavy
-exploration, many file edits), raise the estimate — the framework will use the
-higher of your estimate and the kind default.
-
-### Overflow = re-decompose, never re-select
-
-If a task overflows at runtime, the framework does **not** swap to a bigger
-model. It signals re-decompose: the task comes back to you for further
-splitting. This is deliberate — overflow means the task was too big, and a
-bigger model would just delay the same failure. Split it.
-
-### Exclusion-driven rotation
-
-If a model rate-limits (429/quota), the framework records an exclusion (with
-TTL) and rotates to the next candidate. You don't manage this — but you should
-know it happens. If the *same* model keeps getting excluded, that's a
-provider-side issue, not a decomposition problem.
 
 ## Lessons
 
@@ -471,19 +367,16 @@ LESSON TEMPLATE — copy, fill, append above this comment:
 **Reusable signal**: <a phrase or pattern to watch for in future decompositions>
 -->
 
+
 ## Before You Decompose — Checklist
 
-- [ ] Can I state the goal and final output in one sentence?
-- [ ] Is every task self-contained (no "the above", "its output", "as mentioned")?
-- [ ] Is every cross-task reference declared in `dependsOn`?
-- [ ] Does every task have at least one checkable acceptance criterion?
-- [ ] Is every task's estimated input below the ~50k ceiling (or split further)?
-- [ ] Did I check the Lessons section + memory for past failures on similar work?
-- [ ] For large-output tasks: did I instruct the subagent to use context-mode?
-- [ ] For parallel dispatch with worktree: true: did I run git stash or git commit first? (worktree requires clean tree)
-- [ ] For parallel dispatch: is asyncByDefault set correctly? (async = no splash, fg = PTY splash)
-- [ ] For parallel dispatch: are tasks unique enough to avoid overlap?
-- [ ] After modifying extension source: did I fully restart pi agent? (/reload is interactive-only)
-
-If any answer is "no", don't dispatch — fix the decomposition first. The
-framework will reject bad shapes anyway; fixing them upfront saves a round-trip.
+- [ ] Every leaf passes the 4-question test in "Should You Decompose At All?"
+- [ ] Each leaf has machine-checkable acceptance criteria (no vague terms — V6)
+- [ ] Each leaf is self-contained: full instructions, no references to sibling internals
+- [ ] Kinds are honest (V7 auto-corrects, but don't rely on it)
+- [ ] `estimatedInputTokens` set for children that must read large inputs; nothing near the 50,000 ceiling (V5)
+- [ ] Dependencies declared exactly — no cycles, no undeclared edges (V3/V4)
+- [ ] No explicit `model:` pin without a reason the selector can't infer
+- [ ] Batch leaves are individually sound (batch diversity means no cross-leaf consistency)
+- [ ] Failure story: if a leaf dies, `blockedDependentsOnFailure` keeps the rest of the graph coherent — is that the shape you want?
+- [ ] If it failed before: is there a Lessons entry for this shape, and does the new decomposition follow the fix?
